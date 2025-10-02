@@ -30,7 +30,7 @@ This application works on Tor binary. If you want to build it yourself, you need
 
 ### Prerequisites
 
-This source code is ready to build and use but if you want to add some more features you can clone and add your features too. This is very initial code base, it might contain bugs. It includes pre compiled ```Tor 0.4.2.6``` binary. You can compile your own version of ```Tor``` and include in this project yourself.
+This source code is ready to build and use but if you want to add some more features you can clone and add your features too. This is very initial code base, it might contain bugs. It includes pre compiled ```latest version``` binary. You can compile your own version of ```Tor``` and include in this project yourself.
 
 ## Built With
 
