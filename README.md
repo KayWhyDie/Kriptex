@@ -3,6 +3,7 @@
 Forked from the project Coatex. This is TOR based peer to peer, encrypted chatting application. The aim of this project is to bring chatting application on TOR, enable users to chat with each other with anonymity in mind. This application is on very initial stages yet it provides text messaging with media sharing capability.
 
 ## Screenshots
+```To be upload```
 
 ## Technical Details
 
