@@ -1,0 +1,48 @@
+## Android / Gradle / IntelliJ
+
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# ART/Dalvik
+*.dex
+
+# Java class files
+*.class
+
+# Generated
+bin/
+gen/
+out/
+
+# Gradle
+.gradle/
+build/
+
+# Local configuration file (sdk path, etc)
+local.properties
+
+# Logs
+*.log
+
+# Android Studio / IntelliJ
+*.iml
+.idea/
+.navigation/
+captures/
+
+# External native build
+.externalNativeBuild/
+.cxx/
+
+# macOS
+.DS_Store
+
+# Project-specific
+Kriptex-master/
+
+# Sensitive / local-only assets
+app/src/main/assets/certificates/*.bks
+

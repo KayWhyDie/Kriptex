@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Compatibility attrs for legacy/custom views that were previously provided by external libs. -->
+
+    <declare-styleable name="ExoVideoView">
+        <!-- Used by older ExoVideoView library; kept so AAPT can link. -->
+        <attr name="controller_display_mode" format="string" />
+    </declare-styleable>
+
+    <declare-styleable name="AudioView2">
+        <!-- Used by AudioView2 to point to a control layout. -->
+        <attr name="customLayout" format="reference" />
+    </declare-styleable>
+
+</resources>

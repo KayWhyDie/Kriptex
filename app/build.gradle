@@ -1,0 +1,108 @@
+apply plugin: 'com.android.application'
+apply plugin: 'realm-android'
+apply plugin: 'com.mikepenz.aboutlibraries.plugin'
+
+android {
+    namespace = 'com.ivor.kriptex'
+    compileSdkVersion 34
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    defaultConfig {
+        applicationId "com.ivor.kriptex"
+        minSdkVersion 23
+        targetSdkVersion 34
+        versionCode 1
+        versionName "1.0"
+    vectorDrawables.useSupportLibrary = true
+    multiDexEnabled = true
+    }
+
+    // Ensure Gradle uses an NDK r27+ installed in the SDK so native builds can target
+    // 16KB page sizes (required for Android 15+ compatibility).
+    // Update this string if you install a different r27+ exact folder name under $ANDROID_SDK_ROOT/ndk
+    ndkVersion "27.0.12077973"
+
+    applicationVariants.all { variant ->
+        variant.outputs.all {
+            def flavor = variant.name
+            def versionName = variant.versionName
+            outputFileName = "Kriptex_${flavor}_${versionName}_${versionCode}.apk"
+        }
+    }
+
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path file('cpp/CMakeLists.txt')
+        }
+    }
+
+    packagingOptions.jniLibs {
+        useLegacyPackaging = true
+        keepDebugSymbols += ['**/libctor.so']
+    }
+
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    androidResources {
+        noCompress 'so'
+    }
+}
+
+configurations.all {
+    resolutionStrategy {
+        force 'org.jetbrains.kotlin:kotlin-stdlib:1.8.20'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.20'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.20'
+    }
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+    implementation files('libs/core-1.52.0.0.jar')
+    implementation files('libs/prov-1.52.0.0.jar')
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.fragment:fragment:1.6.2'
+    implementation 'androidx.multidex:multidex:2.0.1'
+    implementation 'androidx.cardview:cardview:1.0.0'
+    // Remove legacy-support-v4, use AndroidX alternatives if needed
+    implementation 'androidx.recyclerview:recyclerview:1.1.0'
+    implementation 'androidx.multidex:multidex:2.0.1'
+    implementation 'androidx.constraintlayout:constraintlayout:1.1.3'
+    implementation 'com.google.android.material:material:1.1.0'
+    implementation 'com.google.code.gson:gson:2.8.6'
+    implementation 'com.google.zxing:core:3.3.0'
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+    // implementation 'com.theartofdev.edmodo:android-image-cropper:2.7.0' // Failing
+    implementation 'com.github.bumptech.glide:glide:4.11.0'
+    annotationProcessor 'com.github.bumptech.glide:compiler:4.11.0'
+    // implementation 'jp.wasabeef:glide-transformations:4.1.0' // Failing
+    implementation 'cn.dreamtobe.filedownloader:filedownloader-okhttp3-connection:1.1.0'
+    implementation 'com.squareup.okhttp3:okhttp:4.4.0'
+    implementation 'com.liulishuo.filedownloader:library:1.7.7'
+    implementation 'commons-codec:commons-codec:1.11'
+    implementation 'org.nanohttpd:nanohttpd:2.3.1'
+    // implementation 'io.realm:android-adapters:3.1.0' // Failing
+    // implementation 'com.devlomi.record-view:record-view:2.0.1' // Failing
+    // implementation 'com.4ert:audioview:1.4.12' // Failing
+    implementation 'com.github.abdularis:androidbuttonprogress:1.0.2'
+    // implementation 'com.adityak:browsemyfiles:1.9' // Failing
+    implementation 'com.github.MasayukiSuda:Mp4Composer-android:v0.3.9'
+    // implementation 'com.github.stfalcon:stfalcon-imageviewer:1.0.1' // Failing
+    implementation 'com.google.android.exoplayer:exoplayer:2.18.7'
+    // implementation 'com.jarvanmo:exoplayerview:2.1.5' // Failing
+    // implementation 'com.github.novoda:merlin:2.0.0'
+    implementation "com.mikepenz:aboutlibraries:11.1.0"
+}

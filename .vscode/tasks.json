@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "adb: restart server",
+      "type": "shell",
+      "command": "C:\\Users\\KWD\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe kill-server; C:\\Users\\KWD\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe start-server"
+    },
+    {
+      "label": "adb: wipe app data (pm clear, all devices)",
+      "type": "shell",
+      "command": "$adb = 'C:\\Users\\KWD\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe'; $pkg = 'com.ivor.kriptex'; $devices = & $adb devices | Select-String '\\tdevice$' | ForEach-Object { ($_.Line -split '\\t')[0] }; if (-not $devices) { throw 'No adb devices attached.' }; foreach ($d in $devices) { Write-Host ('pm clear on ' + $d); & $adb -s $d shell pm clear $pkg | Out-Null }"
+    },
+    {
+      "label": "adb: clean reinstall latest debug APK (all devices)",
+      "type": "shell",
+      "command": "$adb = 'C:\\Users\\KWD\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe'; $pkg = 'com.ivor.kriptex'; $apk = (Get-ChildItem \"${workspaceFolder}\\app\\build\\outputs\\apk\\debug\\*.apk\" | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName; if (-not $apk) { throw 'No debug APK found. Run the build task first.' }; $devices = & $adb devices | Select-String '\\tdevice$' | ForEach-Object { ($_.Line -split '\\t')[0] }; if (-not $devices) { throw 'No adb devices attached.' }; foreach ($d in $devices) { Write-Host ('Reinstalling on ' + $d + ' from ' + $apk); & $adb -s $d shell am force-stop $pkg | Out-Null; & $adb -s $d uninstall $pkg | Out-Null; & $adb -s $d install -g \"$apk\" }"
+    },
+    {
+      "label": "build: assembleDebug",
+      "type": "shell",
+      "command": ".\\gradlew :app:assembleDebug --no-daemon",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "build + adb: assembleDebug then clean reinstall",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "build: assembleDebug",
+        "adb: clean reinstall latest debug APK (all devices)"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "type": "shell",
+      "command": "echo done"
+    }
+  ]
+}
