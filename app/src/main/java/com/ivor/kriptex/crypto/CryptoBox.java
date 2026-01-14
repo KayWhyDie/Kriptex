@@ -21,7 +21,7 @@ import javax.crypto.spec.SecretKeySpec;
  *
  * <p>Encryption input must be exactly 512/1024/2048 bytes.</p>
  */
-public final class CryptoBox {
+final class CryptoBox {
 
     private static final int TAG_LENGTH_BYTES = 16; // 128-bit tag
 
@@ -39,7 +39,7 @@ public final class CryptoBox {
      *
      * <p>Prefers XChaCha20-Poly1305 when available; otherwise uses AES-256-GCM.</p>
      */
-    public static byte[] encrypt(byte[] paddedEnvelope, SecretKey key) throws GeneralSecurityException {
+    static byte[] encrypt(byte[] paddedEnvelope, SecretKey key) throws GeneralSecurityException {
         if (paddedEnvelope == null) {
             throw new IllegalArgumentException("paddedEnvelope is null");
         }
@@ -62,7 +62,7 @@ public final class CryptoBox {
      *
      * <p>Authentication must verify, otherwise this throws and no plaintext is returned.</p>
      */
-    public static byte[] decrypt(byte[] ciphertext, SecretKey key) throws GeneralSecurityException {
+    static byte[] decrypt(byte[] ciphertext, SecretKey key) throws GeneralSecurityException {
         if (ciphertext == null) {
             throw new IllegalArgumentException("ciphertext is null");
         }

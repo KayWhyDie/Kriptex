@@ -65,23 +65,22 @@ public class CryptoBoxSelfTest {
         byte[] payload = new byte[payloadLen];
         RNG.nextBytes(payload);
 
-        byte[] paddedEnvelope = MessageEnvelope.pack((byte) 0x01, payload);
-        int bucket = paddedEnvelope.length;
+        int bucket = expectedBucketForPayloadLength(payloadLen);
         report.append("case: ").append(label).append("\n");
         report.append("  payload_length: ").append(payloadLen).append("\n");
         report.append("  padded_bucket: ").append(bucket).append("\n");
 
-        // Encrypt/decrypt must not parse envelope (opaque bytes).
-        byte[] ciphertext = CryptoBox.encrypt(paddedEnvelope, key);
+        // Strict pipeline: pack -> encrypt (no plaintext/padded exposure).
+        byte[] ciphertext = TransportCodec.encodeForTransport((byte) 0x01, payload, key);
         report.append("  ciphertext_length: ").append(ciphertext.length).append("\n");
 
         int nonceLen = inferNonceLength(ciphertext.length, bucket);
         report.append("  nonce_length: ").append(nonceLen).append("\n");
         report.append("  aead: ").append(nonceLen == 24 ? "XChaCha20-Poly1305" : "AES-256-GCM").append("\n");
 
-        byte[] decrypted = CryptoBox.decrypt(ciphertext, key);
-        assertEquals("decrypted length must equal bucket", bucket, decrypted.length);
-        assertArrayEquals("round-trip mismatch", paddedEnvelope, decrypted);
+        TransportCodec.DecodedMessage decoded = TransportCodec.decodeFromTransport(ciphertext, key);
+        assertEquals("message type mismatch", (byte) 0x01, decoded.messageType);
+        assertArrayEquals("payload mismatch", payload, decoded.payload);
         report.append("  round_trip: OK\n");
 
         // Tamper test (auth must fail, no plaintext returned).
@@ -91,7 +90,7 @@ public class CryptoBoxSelfTest {
 
         boolean authFailed = false;
         try {
-            CryptoBox.decrypt(tampered, key);
+            TransportCodec.decodeFromTransport(tampered, key);
         } catch (GeneralSecurityException | IllegalArgumentException expected) {
             authFailed = true;
         }
@@ -100,6 +99,12 @@ public class CryptoBoxSelfTest {
             throw new AssertionError("tamper did not trigger auth failure");
         }
         report.append("  tamper_auth_failure: OK\n");
+    }
+
+    private static int expectedBucketForPayloadLength(int payloadLen) {
+        // MessageEnvelope header is 4 bytes: version + type + uint16 length.
+        int total = 4 + payloadLen;
+        return StaticLengthPadding.chooseBucketSizeForTotalLength(total);
     }
 
     private static SecretKey random256BitKey() {

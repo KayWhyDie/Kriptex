@@ -18,7 +18,7 @@ import java.security.SecureRandom;
  *
  * <p>This is designed to be encrypted later as a single blob (e.g., AEAD).</p>
  */
-public final class MessageEnvelope {
+final class MessageEnvelope {
 
     public static final byte VERSION_1 = 0x01;
 
@@ -36,7 +36,7 @@ public final class MessageEnvelope {
      * @param payload raw bytes
      * @return fixed-size byte array (512/1024/2048)
      */
-    public static byte[] pack(byte messageType, byte[] payload) {
+    static byte[] pack(byte messageType, byte[] payload) {
         if (payload == null) {
             throw new IllegalArgumentException("payload is null");
         }
@@ -78,7 +78,7 @@ public final class MessageEnvelope {
      * @param padded envelope whose length is exactly 512/1024/2048
      * @return unpacked message type + payload
      */
-    public static Unpacked unpack(byte[] padded) {
+    static Unpacked unpack(byte[] padded) {
         if (padded == null) {
             throw new IllegalArgumentException("padded is null");
         }
@@ -108,7 +108,7 @@ public final class MessageEnvelope {
         return new Unpacked(messageType, payload);
     }
 
-    public static final class Unpacked {
+    static final class Unpacked {
         public final byte messageType;
         public final byte[] payload;
 
