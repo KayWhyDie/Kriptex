@@ -1,0 +1,27 @@
+Kriptex CryptoBox self-test
+timestamp_utc: 2026-01-14T18:32:59.245132800Z
+case: bucket512
+  payload_length: 1
+  padded_bucket: 512
+  ciphertext_length: 540
+  nonce_length: 12
+  aead: AES-256-GCM
+  round_trip: OK
+  tamper_auth_failure: OK
+case: bucket1024
+  payload_length: 700
+  padded_bucket: 1024
+  ciphertext_length: 1052
+  nonce_length: 12
+  aead: AES-256-GCM
+  round_trip: OK
+  tamper_auth_failure: OK
+case: bucket2048
+  payload_length: 1500
+  padded_bucket: 2048
+  ciphertext_length: 2076
+  nonce_length: 12
+  aead: AES-256-GCM
+  round_trip: OK
+  tamper_auth_failure: OK
+result: PASS

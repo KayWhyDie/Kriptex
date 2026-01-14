@@ -4,12 +4,14 @@ import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 
 /**
- * Pads messages to fixed buckets (512/1024/2048 bytes) to reduce metadata leakage.
+ * Static-length padding for metadata-hiding.
  *
- * <p>Format: [2-byte big-endian length][message bytes][random padding]
+ * <p>Format (all big-endian):</p>
+ * <pre>
+ * [2-byte unsigned message length][message bytes][cryptographically-random padding bytes]
+ * </pre>
  *
- * <p>No encryption is performed here; this is intended to be applied to plaintext
- * prior to encryption.
+ * <p>The output length is always exactly one of: 512, 1024, 2048 bytes.</p>
  */
 public final class StaticLengthPadding {
 
@@ -17,131 +19,113 @@ public final class StaticLengthPadding {
     public static final int BUCKET_1024 = 1024;
     public static final int BUCKET_2048 = 2048;
 
-    /**
-     * 2-byte unsigned length header, big-endian.
-     *
-     * <p>Max message payload is {@code bucketSize - HEADER_SIZE}.
-     */
-    public static final int HEADER_SIZE = 2;
-
-    private static final int[] BUCKETS = new int[]{BUCKET_512, BUCKET_1024, BUCKET_2048};
-
-    private static final SecureRandom RNG = new SecureRandom();
+    private static final int HEADER_SIZE = 2;
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     private StaticLengthPadding() {
+        // no instances
     }
 
     /**
-     * Pads {@code message} into the smallest bucket that can contain
-     * {@code HEADER_SIZE + message.length}.
+     * Pads {@code message} to a static bucket size.
      *
-     * @throws IllegalArgumentException if the message is too large (> 2048 minus header)
+     * @param message raw message bytes
+     * @return a new byte array whose length is exactly 512/1024/2048
      */
     public static byte[] pad(byte[] message) {
         if (message == null) {
-            throw new IllegalArgumentException("message == null");
+            throw new IllegalArgumentException("message is null");
         }
 
-        final int messageLength = message.length;
-        final int bucketSize = chooseBucketSizeForMessageLength(messageLength);
-
-        final int maxPayload = bucketSize - HEADER_SIZE;
-        if (messageLength > maxPayload) {
-            // Defensive: chooseBucketSizeForMessageLength should have rejected this.
-            throw new IllegalArgumentException("Message too large for bucket: " + messageLength + " > " + maxPayload);
+        int messageLength = message.length;
+        if (messageLength > (BUCKET_2048 - HEADER_SIZE)) {
+            throw new IllegalArgumentException(
+                    "message too large for largest bucket: " + messageLength + " bytes");
         }
 
-        final byte[] out = new byte[bucketSize];
+        int bucketSize = chooseBucketSizeForMessageLength(messageLength);
+        byte[] out = new byte[bucketSize];
 
-        // 2-byte big-endian length
+        // Header: unsigned 16-bit big-endian message length
         out[0] = (byte) ((messageLength >>> 8) & 0xFF);
         out[1] = (byte) (messageLength & 0xFF);
 
-        // message
+        // Message
         System.arraycopy(message, 0, out, HEADER_SIZE, messageLength);
 
-        // cryptographically random padding (if any)
-        final int paddingStart = HEADER_SIZE + messageLength;
-        final int paddingLen = bucketSize - paddingStart;
-        if (paddingLen > 0) {
-            final byte[] padding = new byte[paddingLen];
-            RNG.nextBytes(padding);
-            System.arraycopy(padding, 0, out, paddingStart, paddingLen);
+        // Padding
+        int paddingStart = HEADER_SIZE + messageLength;
+        if (paddingStart < out.length) {
+            byte[] padding = new byte[out.length - paddingStart];
+            SECURE_RANDOM.nextBytes(padding);
+            System.arraycopy(padding, 0, out, paddingStart, padding.length);
         }
 
         return out;
     }
 
-    /**
-     * Convenience for UTF-8 text.
-     */
-    public static byte[] padUtf8(String text) {
-        if (text == null) {
-            throw new IllegalArgumentException("text == null");
+    public static byte[] padUtf8(String message) {
+        if (message == null) {
+            throw new IllegalArgumentException("message is null");
         }
-        return pad(text.getBytes(StandardCharsets.UTF_8));
+        return pad(message.getBytes(StandardCharsets.UTF_8));
     }
 
     /**
-     * Unpads a padded bucket and returns the original message bytes.
+     * Removes static-length padding produced by {@link #pad(byte[])}.
      *
-     * @throws IllegalArgumentException if the input is not exactly 512/1024/2048 bytes,
-     *                                  or if the embedded length is invalid.
+     * @param padded a byte array whose length is exactly 512/1024/2048
+     * @return the original message bytes
      */
     public static byte[] unpad(byte[] padded) {
         if (padded == null) {
-            throw new IllegalArgumentException("padded == null");
+            throw new IllegalArgumentException("padded is null");
         }
 
-        final int bucketSize = padded.length;
-        if (!isAllowedBucket(bucketSize)) {
-            throw new IllegalArgumentException("Invalid padded length (must be 512/1024/2048): " + bucketSize);
+        int bucketSize = padded.length;
+        if (!isValidBucketSize(bucketSize)) {
+            throw new IllegalArgumentException("invalid bucket size: " + bucketSize);
         }
         if (bucketSize < HEADER_SIZE) {
-            throw new IllegalArgumentException("Invalid padded length: " + bucketSize);
+            throw new IllegalArgumentException("invalid padded input");
         }
 
-        final int length = ((padded[0] & 0xFF) << 8) | (padded[1] & 0xFF);
-        final int maxPayload = bucketSize - HEADER_SIZE;
-        if (length < 0 || length > maxPayload) {
-            throw new IllegalArgumentException("Invalid embedded message length: " + length + " (max " + maxPayload + ")");
+        int messageLength = ((padded[0] & 0xFF) << 8) | (padded[1] & 0xFF);
+        if (messageLength < 0 || messageLength > (bucketSize - HEADER_SIZE)) {
+            throw new IllegalArgumentException("invalid message length in header: " + messageLength);
         }
 
-        final byte[] message = new byte[length];
-        System.arraycopy(padded, HEADER_SIZE, message, 0, length);
+        byte[] message = new byte[messageLength];
+        System.arraycopy(padded, HEADER_SIZE, message, 0, messageLength);
         return message;
     }
 
-    /**
-     * Convenience: unpad to UTF-8 string.
-     */
     public static String unpadToUtf8(byte[] padded) {
         return new String(unpad(padded), StandardCharsets.UTF_8);
     }
 
     /**
-     * Returns the bucket size (512/1024/2048) that can contain this message.
-     *
-     * <p>Note: This accounts for the length header.
+     * Chooses the smallest bucket that can fit {@code HEADER_SIZE + messageLength}.
      */
-    public static int chooseBucketSizeForMessageLength(int messageLength) {
-        if (messageLength < 0) {
-            throw new IllegalArgumentException("messageLength < 0");
-        }
-
-        final int total = HEADER_SIZE + messageLength;
-        for (int bucket : BUCKETS) {
-            if (total <= bucket) {
-                return bucket;
-            }
-        }
-
-        throw new IllegalArgumentException(
-            "Message too large: " + messageLength + " bytes (max " + (BUCKET_2048 - HEADER_SIZE) + ")"
-        );
+    static int chooseBucketSizeForMessageLength(int messageLength) {
+        int total = HEADER_SIZE + messageLength;
+        return chooseBucketSizeForTotalLength(total);
     }
 
-    private static boolean isAllowedBucket(int size) {
-        return size == BUCKET_512 || size == BUCKET_1024 || size == BUCKET_2048;
+    static boolean isValidBucketSize(int bucketSize) {
+        return bucketSize == BUCKET_512 || bucketSize == BUCKET_1024 || bucketSize == BUCKET_2048;
+    }
+
+    static int chooseBucketSizeForTotalLength(int totalLength) {
+        if (totalLength <= BUCKET_512) {
+            return BUCKET_512;
+        }
+        if (totalLength <= BUCKET_1024) {
+            return BUCKET_1024;
+        }
+        if (totalLength <= BUCKET_2048) {
+            return BUCKET_2048;
+        }
+        throw new IllegalArgumentException("message too large");
     }
 }
