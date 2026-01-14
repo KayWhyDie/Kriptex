@@ -11,7 +11,6 @@ import android.view.MenuItem;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
-import android.widget.ImageView;
 import android.widget.ProgressBar;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
@@ -23,8 +22,6 @@ import androidx.appcompat.app.AppCompatActivity;
 
 import com.aditya.filebrowser.Constants;
 import com.aditya.filebrowser.FileChooser;
-import com.bumptech.glide.Glide;
-import com.bumptech.glide.request.RequestOptions;
 import com.google.android.material.textfield.TextInputEditText;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
@@ -54,7 +51,6 @@ public class ImportIdActivity extends AppCompatActivity {
     private static final String TAG = "ImportIdActivity";
     private TextView txtName;
     private TextView txtFilePath;
-    private ImageView imvwImage;
     private ProgressBar progressBar;
     private String mImportFilePath;
 
@@ -69,7 +65,6 @@ public class ImportIdActivity extends AppCompatActivity {
 
         txtName = findViewById(R.id.txtName);
         txtFilePath = findViewById(R.id.txtFilePath);
-        imvwImage = findViewById(R.id.imvwDp);
         progressBar = findViewById(R.id.progressBar);
 
         mImportDataView = findViewById(R.id.includedLayout);
@@ -278,10 +273,6 @@ public class ImportIdActivity extends AppCompatActivity {
                 findViewById(R.id.btnStart).setEnabled(true);
                 txtName.setText(Database.getInstance(getApplicationContext()).get("name"));
 
-                Uri resultUri = Uri.fromFile(new File(getFilesDir(), "dp.jpg"));
-
-                Log.d(TAG, "onPostExecute: Loading DP: " + resultUri.getPath());
-
                 boolean use_dark_theme = Settings.getPrefs(getApplicationContext()).getBoolean("use_dark_theme", false);
                 if (use_dark_theme) {
                     ((RadioButton) findViewById(R.id.rdbtnDarkTheme)).setChecked(true);
@@ -289,14 +280,6 @@ public class ImportIdActivity extends AppCompatActivity {
                     ((RadioButton) findViewById(R.id.rdbtnLightTheme)).setChecked(true);
                 }
 
-                Database.getInstance(getApplicationContext()).put("dp", resultUri.getPath());
-
-//            Picasso.get().load(resultUri).transform(new CircleTransform())
-//                    .into(imvwImage);
-                Glide.with(ImportIdActivity.this)
-                        .load(resultUri)
-                        .apply(RequestOptions.circleCropTransform())
-                        .into(imvwImage);
             } else {
                 Toast.makeText(ImportIdActivity.this, "Unable to import, password might be incorrect", Toast.LENGTH_SHORT).show();
             }

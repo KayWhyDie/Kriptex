@@ -3,10 +3,10 @@
     <!-- Base application theme. -->
     <style name="AppTheme" parent="Theme.AppCompat.DayNight.DarkActionBar">
         <!-- Customize your theme here. -->
-        <item name="colorPrimary">@color/colorPrimary</item>
-        <item name="colorPrimaryDark">@color/colorSlightBlack</item>
-        <item name="colorAccent">@color/colorAccent</item>
-        <item name="android:windowBackground">@color/background</item>
+        <item name="colorPrimary">@color/terminal_surface</item>
+        <item name="colorPrimaryDark">@color/terminal_background</item>
+        <item name="colorAccent">@color/terminal_accent</item>
+        <item name="android:windowBackground">@color/terminal_background</item>
     </style>
 
     <style name="AppTheme.NoActionBar">

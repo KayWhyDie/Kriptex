@@ -23,9 +23,6 @@ import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AlertDialog;
 import androidx.core.content.ContextCompat;
-
-import com.bumptech.glide.Glide;
-import com.bumptech.glide.request.RequestOptions;
 import com.google.android.material.snackbar.Snackbar;
 import com.ivor.kriptex.ChatActivity;
 import com.ivor.kriptex.R;
@@ -34,8 +31,6 @@ import com.ivor.kriptex.db.Message;
 import com.ivor.kriptex.tor.Tor;
 import com.ivor.kriptex.ui.DeleteContact;
 import com.ivor.kriptex.utils.TimeAgo;
-import com.liulishuo.filedownloader.FileDownloader;
-import com.liulishuo.filedownloader.model.FileDownloadStatus;
 
 import java.io.File;
 import java.util.HashSet;
@@ -117,7 +112,6 @@ public class ContactsAdapter extends RealmRecyclerViewAdapter<Contact, ContactVi
                 contactLongPress(viewHolder.contact);
                 return true;
             });
-            viewHolder.imageView.setOnClickListener(view -> showDP(viewHolder.contact));
         }
         return viewHolder;
     }
@@ -127,43 +121,14 @@ public class ContactsAdapter extends RealmRecyclerViewAdapter<Contact, ContactVi
         final Contact contact = getItem(position);
         holder.contact = contact;
         holder.position = position;
-        File file = new File(mContext.getFilesDir(), contact.getAddress() + ".jpg");
         if (mIsShareAdapter) {
             if (mSelectedPositions.contains(position)) {
                 holder.imageView.setImageResource(R.drawable.ic_done_svg);
             } else {
-                if (file.exists()) {
-                    Glide.with(mContext)
-                            .load(Uri.fromFile(file))
-                            .apply(RequestOptions.circleCropTransform())
-                            .into(holder.imageView);
-                }
+                holder.imageView.setImageResource(R.drawable.ic_person);
             }
         } else {
-            if (file.exists()) {
-                Glide.with(mContext)
-                        .load(Uri.fromFile(file))
-                        .apply(RequestOptions.circleCropTransform())
-                        .into(holder.imageView);
-            } else {
-                if (Tor.getInstance(mContext).isReady()) {
-                    String url = "https://" + contact.getAddress() + ".onion:" + Tor.getFileServerPort() + "/dp";
-                    FileDownloader.getImpl()
-                            .create(url)
-                            .setPath(file.getAbsolutePath(), false)
-                            .setTag(contact.getAddress())
-                            .addFinishListener(task -> {
-                                if (task.getStatus() == FileDownloadStatus.completed) {
-                                    new Handler(Looper.getMainLooper()).post(() ->
-                                            Glide.with(mContext)
-                                                    .load(Uri.fromFile(file))
-                                                    .apply(RequestOptions.circleCropTransform())
-                                                    .into(holder.imvwStatus));
-                                }
-                            })
-                            .start();
-                }
-            }
+            holder.imageView.setImageResource(R.drawable.ic_person);
         }
 
         Message lastMessage = getLastMessage(contact);
@@ -234,21 +199,6 @@ public class ContactsAdapter extends RealmRecyclerViewAdapter<Contact, ContactVi
                 .findFirst();
         realm.close();
         return first;
-    }
-
-    void showDP(Contact contact) {
-        ImageView view = new ImageView(mContext);
-        int pad = (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 16, mContext.getResources().getDisplayMetrics());
-        view.setPadding(pad, pad, pad, pad);
-        File path = new File(mContext.getFilesDir(), contact.getAddress() + ".jpg");
-        Glide.with(mContext).load(Uri.fromFile(path)).into(view);
-        Rect displayRectangle = new Rect();
-        int s = (int) (Math.min(displayRectangle.width(), displayRectangle.height()) * 0.9);
-        view.setMinimumWidth(s);
-        view.setMinimumHeight(s);
-        new AlertDialog.Builder(mContext)
-                .setView(view)
-                .show();
     }
 
     @Override

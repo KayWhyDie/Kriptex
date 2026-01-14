@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <color name="terminal_background">#050507</color>
+    <color name="terminal_surface">#0A0507</color>
+    <color name="terminal_accent">#B11226</color>
+
     <color name="colorPrimaryDark">#9B8969</color>
     <color name="colorPrimary">#a59371</color>
     <color name="colorAccent">#85775c</color>

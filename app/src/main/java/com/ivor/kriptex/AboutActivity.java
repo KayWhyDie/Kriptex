@@ -19,6 +19,13 @@ public class AboutActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        if (useComposeAbout()) {
+            startActivity(new android.content.Intent(this, AboutComposeActivity.class));
+            finish();
+            return;
+        }
+
         setContentView(R.layout.activity_about);
         Toolbar toolbar = findViewById(R.id.toolbar);
         setSupportActionBar(toolbar);
@@ -39,6 +46,10 @@ public class AboutActivity extends AppCompatActivity {
                 .supportFragment();
 
         getSupportFragmentManager().beginTransaction().add(R.id.content, libsSupportFragment, "libs").commit();
+    }
+
+    private boolean useComposeAbout() {
+        return true;
     }
 
     @Override

@@ -194,6 +194,7 @@
                     android:layout_gravity="bottom"
                     android:background="?selectableItemBackground"
                     android:text="@string/send"
+                    android:visibility="gone"
                     app:tint="@color/colorAccent"
                     app:srcCompat="@drawable/ic_mic" />
 

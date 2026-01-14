@@ -1,26 +1,17 @@
 package com.ivor.kriptex;
 
 import android.content.Intent;
-import android.net.Uri;
 import android.os.Bundle;
-import android.util.Log;
 import android.view.MenuItem;
 import android.view.View;
 import android.widget.EditText;
-import android.widget.ImageView;
 import android.widget.RadioGroup;
 
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.app.AppCompatDelegate;
 
-import com.bumptech.glide.Glide;
-import com.bumptech.glide.request.RequestOptions;
 import com.ivor.kriptex.db.Database;
 import com.ivor.kriptex.utils.Settings;
-import com.theartofdev.edmodo.cropper.CropImage;
-import com.theartofdev.edmodo.cropper.CropImageView;
-
-import java.io.File;
 
 //import com.ivor.kriptex.transformation.CircleTransform;
 //import com.squareup.picasso.Picasso;
@@ -74,33 +65,5 @@ public class CreateNewActivity extends AppCompatActivity {
         startActivity(intent);
 
         Settings.putBoolean(getApplicationContext(), "start_setup_completed", true);
-    }
-
-    public void onDpBoxClicked(View v) {
-        CropImage.activity()
-                .setGuidelines(CropImageView.Guidelines.ON)
-                .setOutputUri(Uri.fromFile(new File(getFilesDir(), "dp.jpg")))
-                .setFixAspectRatio(true)
-                .start(this);
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == CropImage.CROP_IMAGE_ACTIVITY_REQUEST_CODE) {
-            CropImage.ActivityResult result = CropImage.getActivityResult(data);
-            if (resultCode == RESULT_OK) {
-                Uri resultUri = result.getUri();
-//                Picasso.get().load(resultUri).transform(new CircleTransform())
-//                        .into(((ImageView) findViewById(R.id.imvwDp)));
-                Glide.with(this)
-                        .load(resultUri)
-                        .apply(RequestOptions.circleCropTransform())
-                        .into(((ImageView) findViewById(R.id.imvwDp)));
-                Database.getInstance(this).put("dp", resultUri.getPath());
-                Log.d(TAG, "onActivityResult: " + resultUri.getPath());
-            } else if (resultCode == CropImage.CROP_IMAGE_ACTIVITY_RESULT_ERROR_CODE) {
-            }
-        }
     }
 }

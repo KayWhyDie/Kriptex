@@ -6,7 +6,6 @@ import android.util.Log;
 import android.webkit.MimeTypeMap;
 
 import com.ivor.kriptex.crypto.CryptoUtils;
-import com.ivor.kriptex.db.Database;
 import com.ivor.kriptex.db.FileShare;
 import com.ivor.kriptex.db.Message;
 
@@ -111,39 +110,34 @@ public class FileServer extends NanoHTTPD {
 //        if(mActivity.isServeFile()) {
 
         File file;
-        if (session.getUri().equals("/dp")) {
-            file = new File(Database.getInstance(mContext).get("dp"));
-            if (!file.exists()) {
-                return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/*", "Forbidden");
+        Map<String, String> headers = session.getHeaders();
+        Realm realm = Realm.getDefaultInstance();
+        String fn = session.getUri().substring(1);
+        String password = headers.get("password");
+        Log.d(TAG, "serve: Trying to find file: " + fn);
+        FileShare fileShare = realm.where(FileShare.class)
+                .beginGroup()
+                .equalTo("filename", fn)
+                .and()
+                .equalTo("password", password)
+                .endGroup()
+                .sort("_id", Sort.DESCENDING).findFirst();
+
+        if (fileShare != null && !fileShare.isServed()) {
+            file = new File(fileShare.getFilePath());
+            if (file.exists()) {
+                Log.d(TAG, "serve: File found serving: " + fileShare.getFilePath());
+            } else {
+                Log.d(TAG, "serve: File not found: " + fileShare.getFilePath());
+                realm.close();
+                return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/*", FILE_NOT_FOUND + "");
             }
         } else {
-            Map<String, String> headers = session.getHeaders();
-            Realm realm = Realm.getDefaultInstance();
-            String fn = session.getUri().substring(1);
-            String password = headers.get("password");
-            Log.d(TAG, "serve: Trying to find file: " + fn);
-            FileShare fileShare = realm.where(FileShare.class)
-                    .beginGroup()
-                    .equalTo("filename", fn)
-                    .and()
-                    .equalTo("password", password)
-                    .endGroup()
-                    .sort("_id", Sort.DESCENDING).findFirst();
-
-            if (fileShare != null && !fileShare.isServed()) {
-                file = new File(fileShare.getFilePath());
-                if (file.exists()) {
-                    Log.d(TAG, "serve: File found serving: " + fileShare.getFilePath());
-                } else {
-                    Log.d(TAG, "serve: File not found: " + fileShare.getFilePath());
-                    return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/*", FILE_NOT_FOUND + "");
-                }
-            } else {
-                Log.d(TAG, "serve: File not found: " + fn);
-                return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/*", "" + FILE_NOT_SERVABLE);
-            }
+            Log.d(TAG, "serve: File not found: " + fn);
             realm.close();
+            return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/*", "" + FILE_NOT_SERVABLE);
         }
+        realm.close();
         String mimeType = getMimeType(file.getAbsolutePath());
         response = serveFile(session.getUri(), session.getHeaders(), file, mimeType);
         return response;

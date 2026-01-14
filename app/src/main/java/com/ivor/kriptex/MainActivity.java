@@ -71,7 +71,6 @@ import com.ivor.kriptex.tor.Tor;
 import com.ivor.kriptex.utils.Settings;
 import com.ivor.kriptex.utils.Util;
 import com.ivor.kriptex.view.TorStatusView;
-import com.theartofdev.edmodo.cropper.CropImage;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -106,16 +105,21 @@ public class MainActivity extends AppCompatActivity {
     public ContactsAdapter mContactsAdapter;
     private RealmResults<Contact> mContacts;
 
+    private boolean useComposeMain() {
+        return true;
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        boolean use_dark_mode = Settings.getPrefs(this).getBoolean("use_dark_mode", false);
-
-        if (use_dark_mode) {
-            AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES);
-        } else {
-            AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO);
+        // Compose migration: main UI is now implemented in MainComposeActivity.
+        // Keep this Activity as a compatibility shim for any stale intents.
+        if (useComposeMain()) {
+            startActivity(new Intent(this, MainComposeActivity.class)
+                .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
+            finish();
+            return;
         }
 
         setContentView(R.layout.activity_main);
@@ -359,15 +363,6 @@ public class MainActivity extends AppCompatActivity {
                 final String finalPayload = payload;
                 runOnUiThread(() -> handleQrPayload(finalPayload));
             }, "qr-decode").start();
-        } else if (requestCode == CropImage.CROP_IMAGE_ACTIVITY_REQUEST_CODE) {
-            CropImage.ActivityResult result = CropImage.getActivityResult(data);
-            if (resultCode == RESULT_OK) {
-                Uri resultUri = result.getUri();
-//                setDP(resultUri);
-                Database.getInstance(this).put("dp", resultUri.getPath());
-                Log.d(TAG, "onActivityResult: " + resultUri.getPath());
-            } else if (resultCode == CropImage.CROP_IMAGE_ACTIVITY_RESULT_ERROR_CODE) {
-            }
         }
     }
 
@@ -806,7 +801,9 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        mContacts.removeAllChangeListeners();
+        if (mContacts != null) {
+            mContacts.removeAllChangeListeners();
+        }
     }
 
     void snack(String s) {
@@ -933,13 +930,19 @@ public class MainActivity extends AppCompatActivity {
             realm.close();
         }
         Button button = findViewById(R.id.btnRequests);
-        if (incoming > 0) {
-            button.setVisibility(View.VISIBLE);
-            button.setText(getResources().getQuantityString(R.plurals.new_requests, incoming, incoming));
-        } else {
-            // Keep Requests accessible even when there are no pending requests.
-            button.setVisibility(View.VISIBLE);
-            button.setText(R.string.requests);
+        TextView badge = findViewById(R.id.txtRequestsBadge);
+
+        // Keep Requests accessible even when there are no pending requests.
+        button.setVisibility(View.VISIBLE);
+        button.setText(R.string.requests);
+
+        if (badge != null) {
+            if (incoming > 0) {
+                badge.setVisibility(View.VISIBLE);
+                badge.setText(incoming > 99 ? "99" : String.valueOf(incoming));
+            } else {
+                badge.setVisibility(View.GONE);
+            }
         }
     }
 }

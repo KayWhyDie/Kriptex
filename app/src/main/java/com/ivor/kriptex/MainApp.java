@@ -2,6 +2,7 @@ package com.ivor.kriptex;
 
 import android.util.Log;
 
+import androidx.appcompat.app.AppCompatDelegate;
 import androidx.multidex.MultiDexApplication;
 
 import com.ivor.kriptex.tor.FileServer;
@@ -45,30 +46,89 @@ public class MainApp extends MultiDexApplication {
     public void onCreate() {
         super.onCreate();
 
+        // Single-theme app: always dark. UI no longer follows a toggle.
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES);
+
         Realm.init(this);
 
         // The RealmConfiguration is created using the builder pattern.
         // The Realm file will be located in Context.getFilesDir() with name "myrealm.realm"
         RealmConfiguration config = new RealmConfiguration.Builder()
                 .name("myrealm.realm")
-                .schemaVersion(2)
+                // This app performs some Realm writes from UI events (e.g., sending messages,
+                // creating rooms). Allowing UI-thread writes prevents runtime crashes.
+                .allowWritesOnUiThread(true)
+                .allowQueriesOnUiThread(true)
+            .schemaVersion(4)
                 .migration((realm, oldVersion, newVersion) -> {
 
                     Log.d(TAG, "onCreate: Old Version: " + oldVersion + " New Version: " + newVersion);
 
-                    if (oldVersion == 0 && newVersion == 1) {
-                        RealmSchema schema = realm.getSchema();
-                        schema.get("Contact")
-                                .addField("pubKey", byte[].class);
-//                        oldVersion++;
-                    }
+                    RealmSchema schema = realm.getSchema();
+                    while (oldVersion < newVersion) {
+                        if (oldVersion == 0) {
+                            if (schema.get("Contact") != null && !schema.get("Contact").hasField("pubKey")) {
+                                schema.get("Contact").addField("pubKey", byte[].class);
+                            }
+                            oldVersion++;
+                            continue;
+                        }
 
-                    if (oldVersion == 1 && newVersion == 2) {
-                        RealmSchema schema = realm.getSchema();
-                        Log.d(TAG, "onCreate: changing contact schema and lastOnelineTime");
-                        schema.get("Contact")
-                                .addField("lastOnlineTime", Long.class);
-//                        oldVersion++;
+                        if (oldVersion == 1) {
+                            Log.d(TAG, "onCreate: changing contact schema and lastOnlineTime");
+                            if (schema.get("Contact") != null && !schema.get("Contact").hasField("lastOnlineTime")) {
+                                schema.get("Contact").addField("lastOnlineTime", Long.class);
+                            }
+                            oldVersion++;
+                            continue;
+                        }
+
+                        if (oldVersion == 2) {
+                            // Chatrooms + room messages.
+                            if (schema.get("ChatRoom") == null) {
+                                schema.create("ChatRoom")
+                                        .addField("id", String.class, io.realm.FieldAttribute.PRIMARY_KEY, io.realm.FieldAttribute.REQUIRED)
+                                        .addField("name", String.class)
+                                        .addField("createdAt", long.class)
+                                        .addIndex("name")
+                                        .addIndex("createdAt");
+                            }
+                            if (schema.get("ChatRoomMember") == null) {
+                                schema.create("ChatRoomMember")
+                                        .addField("primaryKey", String.class, io.realm.FieldAttribute.PRIMARY_KEY, io.realm.FieldAttribute.REQUIRED)
+                                        .addField("roomId", String.class)
+                                        .addField("address", String.class)
+                                        .addField("alias", String.class)
+                                        .addIndex("roomId")
+                                        .addIndex("address");
+                            }
+                            if (schema.get("Message") != null) {
+                                if (!schema.get("Message").hasField("roomId")) {
+                                    schema.get("Message").addField("roomId", String.class).addIndex("roomId");
+                                }
+                                if (!schema.get("Message").hasField("roomMessageId")) {
+                                    schema.get("Message").addField("roomMessageId", String.class).addIndex("roomMessageId");
+                                }
+                                if (!schema.get("Message").hasField("roomSystemType")) {
+                                    schema.get("Message").addField("roomSystemType", String.class).addIndex("roomSystemType");
+                                }
+                            }
+                            oldVersion++;
+                            continue;
+                        }
+
+                        if (oldVersion == 3) {
+                            // Unread indicators per room.
+                            if (schema.get("ChatRoom") != null && !schema.get("ChatRoom").hasField("lastReadStableId")) {
+                                schema.get("ChatRoom")
+                                        .addField("lastReadStableId", long.class)
+                                        .addIndex("lastReadStableId");
+                            }
+                            oldVersion++;
+                            continue;
+                        }
+
+                        oldVersion++;
                     }
                 })
                 .build();

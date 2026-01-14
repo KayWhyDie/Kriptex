@@ -54,7 +54,13 @@ public class Client {
     private StatusListener statusListener;
 
     private volatile HashSet<String> mMessageSending = new HashSet<>();
-    private volatile AtomicInteger mTries = new AtomicInteger(0);
+
+    // Coalesce repeated start requests while a send loop is running for a given address.
+    // This is NOT a retry counter; it just signals “run another pass”.
+    private volatile AtomicInteger mRescanPendingSends = new AtomicInteger(0);
+
+    private static final int SEND_RETRY_MAX_ATTEMPTS = 3;
+    private static final long SEND_RETRY_BASE_DELAY_MS = 2_500L;
 
     private final AtomicBoolean mSendingPendingFriends = new AtomicBoolean(false);
 
@@ -169,6 +175,10 @@ public class Client {
      */
     private boolean sendMsg(Sock sock, Message message, Contact contact) throws Exception {
         if (sock.isClosed()) {
+            return false;
+        }
+        if (contact == null || contact.getPubKey() == null || contact.getPubKey().length == 0) {
+            // Can't send without the recipient RSA pubkey; key exchange will be handled elsewhere.
             return false;
         }
         resolveQuoteMessageId(message); // resolve quoted message id
@@ -294,6 +304,9 @@ public class Client {
                 updateRealm.close();
             }
 
+            // Now that we have a pubkey, try sending any queued messages.
+            startSendPendingMessages(address);
+
             log("friend request sent");
         }
     }
@@ -301,9 +314,8 @@ public class Client {
     public void doSendAllPendingMessages() {
         log("do send all pending messages");
         Realm realm = Realm.getDefaultInstance();
-        RealmResults<Contact> contacts = realm.where(Contact.class).equalTo("outgoing", 1).findAll();
+        RealmResults<Contact> contacts = realm.where(Contact.class).equalTo("incoming", 0).findAll();
         for (Contact c : contacts) {
-            log("try to send friend request");
             try {
                 doSendPendingMessages(c);
             } catch (Exception e) {
@@ -316,22 +328,43 @@ public class Client {
     private void doSendPendingMessages(Contact contact) throws Exception {
         log("do send pending messages");
         Realm realm = Realm.getDefaultInstance();
-        RealmResults<Message> messages = realm.where(Message.class).equalTo("pending", 1).equalTo("receiver", contact.getAddress()).findAll();
-        Sock sock = connect(contact.getAddress());
-        for (Message m : messages) {
-            log("try to send message: " + m.getPrimaryKey());
-            if (sendMsg(sock, realm.copyFromRealm(m), contact)) {
-                if (m.isValid()) {
-                    realm.beginTransaction();
-                    m.setPending(0);
-                    contact.setLastMessageTime(m.getTime());
-                    realm.commitTransaction();
-                }
-                log("message sent");
+        Sock sock = null;
+        try {
+            Contact live = realm.where(Contact.class).equalTo("address", contact.getAddress()).findFirst();
+            if (live == null) return;
+
+            if (live.getPubKey() == null || live.getPubKey().length == 0) {
+                // If the contact exists but has no key yet, trigger key exchange and retry later.
+                realm.executeTransaction(r -> live.setOutgoing(1));
+                startSendPendingFriends();
+                return;
             }
+
+            RealmResults<Message> messages = realm.where(Message.class)
+                    .equalTo("pending", 1)
+                    .equalTo("receiver", live.getAddress())
+                    .findAll();
+
+            sock = connect(live.getAddress());
+            for (Message m : messages) {
+                log("try to send message: " + m.getPrimaryKey());
+                if (sendMsg(sock, realm.copyFromRealm(m), live)) {
+                    if (m.isValid()) {
+                        realm.beginTransaction();
+                        m.setPending(0);
+                        live.setLastMessageTime(m.getTime());
+                        realm.commitTransaction();
+                    }
+                    log("message sent");
+                }
+            }
+        } finally {
+            try {
+                if (sock != null) sock.close();
+            } catch (Exception ignored) {
+            }
+            realm.close();
         }
-        realm.close();
-        sock.close();
     }
 
     /**
@@ -340,31 +373,55 @@ public class Client {
      * @param address
      */
     public void startSendPendingMessages(final String address) {
+        // Always signal that there's work to do.
+        mRescanPendingSends.incrementAndGet();
+
         if (mMessageSending.contains(address)) {
-            mTries.incrementAndGet();
             return;
         }
+
         mMessageSending.add(address);
         log("start send pending messages");
         start(() -> {
             Realm realm = Realm.getDefaultInstance();
-            Contact contact = realm.where(Contact.class).equalTo("address", address).findFirst();
-            if (contact != null) {
-                int tries;
-                do {
-                    try {
-                        doSendPendingMessages(contact);
-                    } catch (Exception e) {
-                        e.printStackTrace();
+            try {
+                Contact contact = realm.where(Contact.class).equalTo("address", address).findFirst();
+                if (contact == null) return;
+
+                // Keep doing passes as long as callers keep enqueueing work.
+                while (mRescanPendingSends.getAndSet(0) > 0) {
+                    boolean sentSomething = false;
+                    int attempt = 0;
+                    while (true) {
+                        try {
+                            doSendPendingMessages(contact);
+                            sentSomething = true;
+                            break;
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            attempt++;
+                            if (attempt > SEND_RETRY_MAX_ATTEMPTS) {
+                                break;
+                            }
+                            try {
+                                long delay = SEND_RETRY_BASE_DELAY_MS * attempt;
+                                Thread.sleep(delay);
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                break;
+                            }
+                        }
                     }
-                    tries = mTries.decrementAndGet();
-                    log("Tries are : " + tries);
-                } while (tries > 0);
-                // if mTires is less than 0 set the value to 0
-                if (mTries.get() < 0) mTries.set(0);
+
+                    // If we failed to send (or likely have more pending after partial send), schedule another pass.
+                    if (!sentSomething) {
+                        mRescanPendingSends.incrementAndGet();
+                    }
+                }
+            } finally {
+                realm.close();
+                mMessageSending.remove(address);
             }
-            realm.close();
-            mMessageSending.remove(address);
         });
     }
 

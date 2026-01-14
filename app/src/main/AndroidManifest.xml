@@ -49,6 +49,11 @@
         <activity
             android:name=".AboutActivity"
             android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar" />
+
+        <activity
+            android:name=".AboutComposeActivity"
+            android:theme="@style/AppTheme.NoActionBar"
+            android:exported="false" />
         <activity
             android:name=".VideoViewActivity"
             android:theme="@style/Theme.AppCompat.Light.NoActionBar.FullScreen" />
@@ -57,16 +62,41 @@
             android:name=".service.VideoTranscodeService"
             android:exported="false" />
 
-        <activity android:name=".ImportIdActivity" />
+        <activity android:name=".ImportIdComposeActivity" />
+        <activity android:name=".CreateNewComposeActivity" />
         <activity
-            android:name=".CreateNewActivity"
-            android:configChanges="uiMode" />
-        <activity android:name=".StartActivity" android:exported="true">
+            android:name=".MainComposeActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden"
+            android:theme="@style/AppTheme.NoActionBar" />
+        <activity
+            android:name=".StartComposeActivity"
+            android:exported="true" />
+
+        <activity-alias
+            android:name=".LauncherDefault"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/app_name"
+            android:targetActivity=".StartComposeActivity">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherCalculator"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@drawable/ic_calculator"
+            android:label="@string/app_name_calculator"
+            android:targetActivity=".StartComposeActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
         <activity
             android:name=".ShareMediaActivity"
             android:label="@string/title_activity_share_media"
@@ -80,6 +110,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ShareMediaComposeActivity"
+            android:theme="@style/AppTheme.NoActionBar"
+            android:exported="false" />
+
         <receiver android:name=".AutoStartReceiver" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
@@ -90,14 +125,24 @@
             android:name=".SendMediaActivity"
             android:theme="@style/AppTheme.NoActionBar" />
         <activity
+            android:name=".SendMediaComposeActivity"
+            android:theme="@style/AppTheme.NoActionBar"
+            android:exported="false" />
+        <activity
             android:name=".SettingsActivity"
             android:configChanges="uiMode"
             android:label="@string/title_activity_settings"
             android:theme="@style/AppTheme" />
+
         <activity
-            android:name=".ChatActivity"
+            android:name=".SettingsComposeActivity"
+            android:theme="@style/AppTheme.NoActionBar"
+            android:exported="false" />
+        <activity
+            android:name=".ChatRoomComposeActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden"
-            android:theme="@style/AppTheme.NoActionBar" />
+            android:theme="@style/AppTheme.NoActionBar"
+            android:exported="false" />
 
         <service
             android:name=".service.KriptexHostService"

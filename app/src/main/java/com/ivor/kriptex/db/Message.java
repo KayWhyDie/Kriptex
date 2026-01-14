@@ -57,6 +57,13 @@ public class Message extends RealmObject {
     private String quotedMessageContent;
     private FileShare fileShare;
 
+    @Index
+    private String roomId;
+    @Index
+    private String roomMessageId;
+    @Index
+    private String roomSystemType;
+
     public String getPrimaryKey() {
         return primaryKey;
     }
@@ -161,6 +168,30 @@ public class Message extends RealmObject {
         this.quotedMessageContent = quotedMessageContent;
     }
 
+    public String getRoomId() {
+        return roomId;
+    }
+
+    public void setRoomId(String roomId) {
+        this.roomId = roomId;
+    }
+
+    public String getRoomMessageId() {
+        return roomMessageId;
+    }
+
+    public void setRoomMessageId(String roomMessageId) {
+        this.roomMessageId = roomMessageId;
+    }
+
+    public String getRoomSystemType() {
+        return roomSystemType;
+    }
+
+    public void setRoomSystemType(String roomSystemType) {
+        this.roomSystemType = roomSystemType;
+    }
+
     public synchronized static boolean addUnreadIncomingMessage(Context context, Message message) {
         Realm realm = Realm.getDefaultInstance();
         Log.d(TAG, "addUnreadIncomingMessage: " + message.getSender() + " " + message.getRemoteMessageId());
@@ -245,6 +276,38 @@ public class Message extends RealmObject {
         realm.commitTransaction();
         realm.close();
         return message.getPrimaryKey();
+    }
+
+    public static synchronized String addPendingOutgoingRoomTextMessage(
+            String sender,
+            String receiver,
+            String roomId,
+            String roomMessageId,
+            String roomSystemType,
+            String content) {
+        Realm realm = Realm.getDefaultInstance();
+        realm.beginTransaction();
+        Message message = realm.createObject(Message.class, UUID.randomUUID().toString());
+        message.setStableId(getNextStableId());
+        message.setSender(sender);
+        message.setReceiver(receiver);
+        message.setRoomId(roomId);
+        message.setRoomMessageId(roomMessageId);
+        message.setRoomSystemType(roomSystemType);
+        message.setContent(content);
+        message.setTime(System.currentTimeMillis());
+        message.setPending(1);
+        message.setType(TYPE_TEXT);
+
+        Contact contact = realm.where(Contact.class).equalTo("address", receiver).findFirst();
+        if (contact != null) {
+            contact.setLastMessageTime(message.getTime());
+        }
+
+        realm.commitTransaction();
+        String primaryKey = message.getPrimaryKey();
+        realm.close();
+        return primaryKey;
     }
 
     public static synchronized String addPendingOutgoingMessage(

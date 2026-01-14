@@ -83,6 +83,22 @@ public class ShareMediaActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        if (useComposeShare()) {
+            Intent in = getIntent();
+            Intent forward = new Intent(this, ShareMediaComposeActivity.class);
+            forward.setAction(in.getAction());
+            forward.setType(in.getType());
+            forward.putExtras(in);
+            if (in.getClipData() != null) {
+                forward.setClipData(in.getClipData());
+            }
+            forward.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(forward);
+            finish();
+            return;
+        }
+
         setContentView(R.layout.activity_share_media);
         Toolbar toolbar = findViewById(R.id.toolbar);
         setSupportActionBar(toolbar);
@@ -186,6 +202,10 @@ public class ShareMediaActivity extends AppCompatActivity {
                     new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},
                     PR_WRITE_EXTERNAL_STORAGE);
         }
+    }
+
+    private boolean useComposeShare() {
+        return true;
     }
 
     private boolean checkSizeIsLarge(String filepath) {

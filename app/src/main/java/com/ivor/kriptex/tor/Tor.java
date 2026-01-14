@@ -510,6 +510,9 @@ public class Tor {
     }
 
     public String encryptByPublicKey(String data, byte[] pubKeySpecBytes) throws NoSuchPaddingException, NoSuchAlgorithmException, BadPaddingException, IllegalBlockSizeException, InvalidKeyException, InvalidKeySpecException, NoSuchProviderException {
+        if (pubKeySpecBytes == null || pubKeySpecBytes.length == 0) {
+            throw new InvalidKeyException("pubKeySpecBytes is null/empty");
+        }
         RSAPublicKeySpec publicKeySpec = new RSAPublicKeySpec(new BigInteger(pubKeySpecBytes), BigInteger.valueOf(65537));
         PublicKey publicKey = getKeyFactory().generatePublic(publicKeySpec);
 

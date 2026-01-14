@@ -26,7 +26,10 @@ import java.net.SocketTimeoutException;
 
 public class Sock {
 
-    static final int TIMEOUT = 60000;
+    // Tor hidden service connections can be slow, but 60s stalls make chat feel broken.
+    // Keep these bounded so Client retry logic can kick in.
+    static final int CONNECT_TIMEOUT_MS = 45000;
+    static final int READ_TIMEOUT_MS = 30000;
     Socket mSock;
     BufferedReader mReader;
     BufferedWriter mWriter;
@@ -36,7 +39,8 @@ public class Sock {
         Proxy proxyTor = new Proxy(Proxy.Type.SOCKS, proxyAddr);
         mSock = new Socket(proxyTor);
         try {
-            mSock.connect(new InetSocketAddress(host, port), TIMEOUT);
+            mSock.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
+            mSock.setSoTimeout(READ_TIMEOUT_MS);
             mReader = new BufferedReader(new InputStreamReader(mSock.getInputStream()));
             mWriter = new BufferedWriter(new OutputStreamWriter(mSock.getOutputStream()));
         } catch (IOException e) {

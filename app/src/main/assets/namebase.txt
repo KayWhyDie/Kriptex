@@ -1,0 +1,2 @@
+cryptic, bleak, brutalist, encrypted, silent, nocturnal, spectral, tactical, covert, neural, synthetic, ambient, cold, lunar, digital, atomic, phantom, dormant, obscure, rugged, sterile, void, volatile, remote, hidden, shadow
+signal, protocol, socket, cipher, node, circuit, lattice, relay, tunnel, vault, vector, archive, kernel, reactor, matrix, beacon, channel, agent, artifact, portal, sector, module, buffer, packet, system, room, server

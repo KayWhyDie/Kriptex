@@ -1,19 +1,34 @@
 apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
+// Realm's Gradle plugin expects a configuration named 'kapt' when Kotlin is applied.
+// We intentionally avoid applying the kotlin-kapt plugin here because this project uses
+// a Gradle 9 milestone wrapper, and kotlin-kapt currently fails to create tasks under it.
+configurations {
+    kapt
+    kaptTest
+    kaptAndroidTest
+}
+
 apply plugin: 'realm-android'
 apply plugin: 'com.mikepenz.aboutlibraries.plugin'
 
 android {
     namespace = 'com.ivor.kriptex'
-    compileSdkVersion 34
+    compileSdk 34
 
     buildFeatures {
         buildConfig = true
+        compose = true
+    }
+
+    composeOptions {
+        kotlinCompilerExtensionVersion '1.5.14'
     }
 
     defaultConfig {
         applicationId "com.ivor.kriptex"
-        minSdkVersion 23
-        targetSdkVersion 34
+        minSdk 23
+        targetSdk 34
         versionCode 1
         versionName "1.0"
     vectorDrawables.useSupportLibrary = true
@@ -56,6 +71,10 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
     androidResources {
         noCompress 'so'
     }
@@ -63,9 +82,9 @@ android {
 
 configurations.all {
     resolutionStrategy {
-        force 'org.jetbrains.kotlin:kotlin-stdlib:1.8.20'
-        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.20'
-        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.20'
+        force 'org.jetbrains.kotlin:kotlin-stdlib:1.9.24'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.24'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.24'
     }
 }
 
@@ -73,6 +92,15 @@ dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
     implementation files('libs/core-1.52.0.0.jar')
     implementation files('libs/prov-1.52.0.0.jar')
+
+    // Jetpack Compose (UI-only; app logic stays as-is)
+    implementation platform('androidx.compose:compose-bom:2024.10.00')
+    implementation 'androidx.activity:activity-compose:1.9.3'
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+    implementation 'androidx.compose.foundation:foundation'
+    implementation 'androidx.compose.material3:material3'
+    debugImplementation 'androidx.compose.ui:ui-tooling'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'androidx.fragment:fragment:1.6.2'
     implementation 'androidx.multidex:multidex:2.0.1'

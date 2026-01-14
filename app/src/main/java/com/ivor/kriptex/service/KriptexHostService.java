@@ -38,6 +38,8 @@ public class KriptexHostService extends Service {
     // Constants
     public static final int ID_SERVICE = 101;
 
+    public static final String ACTION_DISCONNECT = "com.ivor.kriptex.action.DISCONNECT";
+
     private Merlin mMerlin;
 
     public KriptexHostService() {
@@ -82,6 +84,12 @@ public class KriptexHostService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && ACTION_DISCONNECT.equals(intent.getAction())) {
+            stopForeground(true);
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
         Server.getInstance(this);
         Tor.getInstance(this);
         Client.getInstance(this);
@@ -177,6 +185,14 @@ public class KriptexHostService extends Service {
         PendingIntent intent = PendingIntent.getActivity(this, 0,
             notificationIntent, pendingIntentFlags);
 
+        Intent disconnectIntent = new Intent(this, KriptexHostService.class).setAction(ACTION_DISCONNECT);
+        PendingIntent disconnectPendingIntent = PendingIntent.getService(
+            this,
+            1,
+            disconnectIntent,
+            pendingIntentFlags
+        );
+
         if (progress > -1 && progress < 99) {
             notificationBuilder.setProgress(100, progress, false);
         } else if (progress < 0 && text.contains("Registering")) {
@@ -190,6 +206,7 @@ public class KriptexHostService extends Service {
                 .setPriority(NotificationCompat.PRIORITY_MIN)
                 .setCategory(NotificationCompat.CATEGORY_SERVICE)
                 .setContentIntent(intent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "DISCONNECT", disconnectPendingIntent)
                 .build();
 
         startForeground(ID_SERVICE, notification);
@@ -218,8 +235,10 @@ public class KriptexHostService extends Service {
     public void onDestroy() {
         Log.d(TAG, "onDestroy");
 
-        mTimer.cancel();
-        mTimer.purge();
+        if (mTimer != null) {
+            mTimer.cancel();
+            mTimer.purge();
+        }
 
         if (mMerlin != null) mMerlin.unbind();
 

@@ -59,5 +59,6 @@
   "java.configuration.updateBuildConfiguration": "automatic",
   "terminal.integrated.env.windows": {
     "Path": "${env:Path};C:\\Users\\KWD\\AppData\\Local\\Android\\Sdk\\platform-tools"
-  }
+  },
+  "cmake.sourceDirectory": "C:/Users/KWD/Documents/GitHub/Kriptex/Kriptex-master/app/cpp"
 }

@@ -19,6 +19,8 @@ import android.util.Log;
 import com.google.gson.Gson;
 import com.ivor.kriptex.BuildConfig;
 import com.ivor.kriptex.crypto.AdvancedCrypto;
+import com.ivor.kriptex.db.ChatRoom;
+import com.ivor.kriptex.db.ChatRoomMember;
 import com.ivor.kriptex.db.Contact;
 import com.ivor.kriptex.db.Message;
 import com.ivor.kriptex.db.TorData;
@@ -36,14 +38,18 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
+import android.util.Base64;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.realm.Realm;
+import io.realm.RealmResults;
 
 public class Server {
+
+    private static final String ROOMMSG_PREFIX = "roommsg:";
 
     public static final int CODE_UNKNOWN = 0;
     public static final int CODE_DATA_RECEIVED = 1;
@@ -207,6 +213,46 @@ public class Server {
         Log.i(TAG, s);
     }
 
+    private static class RoomMsg {
+        final String roomId;
+        final String roomMessageId;
+        final String systemType;
+        final String payload;
+
+        RoomMsg(String roomId, String roomMessageId, String systemType, String payload) {
+            this.roomId = roomId;
+            this.roomMessageId = roomMessageId;
+            this.systemType = systemType;
+            this.payload = payload;
+        }
+    }
+
+    private RoomMsg parseRoomMsg(String content) {
+        if (content == null) return null;
+        if (!content.startsWith(ROOMMSG_PREFIX)) return null;
+
+        // roommsg:<roomId>:<roomMessageId>:<type>:<base64>
+        String[] tokens = content.split(":", 5);
+        if (tokens.length != 5) return null;
+        if (!"roommsg".equals(tokens[0])) return null;
+
+        String roomId = tokens[1];
+        String roomMessageId = tokens[2];
+        String typeToken = tokens[3];
+        String encoded = tokens[4];
+        if (roomId == null || roomId.isEmpty()) return null;
+
+        String payload;
+        try {
+            payload = new String(Util.base64decode(encoded), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
+        }
+
+        String systemType = (typeToken == null || typeToken.isEmpty() || "-".equals(typeToken)) ? null : typeToken;
+        return new RoomMsg(roomId, roomMessageId, systemType, payload);
+    }
+
     public void addListener(Listener l) {
         if (!mListeners.contains(l)) {
             mListeners.add(l);
@@ -269,12 +315,20 @@ public class Server {
             if (td.getDataType() == TorData.TYPE_REQUEST) {
                 String data = td.getData();
                 TorRequest tr = gson.fromJson(data, TorRequest.class);
-                Contact.addContact(mContext, sender, tr.getSenderName(), tr.getDescription(), Util.base64decode(pubKeySpec), false, true);
+                // Requests page has been removed: accept silently so key exchange still works.
+                Contact.addContact(
+                        mContext,
+                        sender,
+                        tr.getSenderName(),
+                        tr.getDescription(),
+                        Util.base64decode(pubKeySpec),
+                        false,
+                        false
+                );
                 for (Listener l : mListeners) {
                     if (l != null) l.onChange();
                 }
-                Notifier.getInstance(mContext).showRequestNotification(tr.getSenderName(), tr.getDescription());
-                log("add ok");
+                log("add ok (silently accepted)");
             } else {
                 log("Not a request message");
             }
@@ -287,13 +341,29 @@ public class Server {
             TorData td = gson.fromJson(content, TorData.class);
             String sender = td.getSender();
             Realm realm = Realm.getDefaultInstance();
-            Contact contact = realm.where(Contact.class).equalTo("address", sender).findFirst();
-            if (contact == null) {
-                log("Contact not found with " + sender);
-                return "" + CODE_CONTACT_NOT_FOUND;
-            }
-            byte[] pubKey = contact.getPubKey();
-            String signature = td.getSignature();
+            try {
+                Contact contact = realm.where(Contact.class).equalTo("address", sender).findFirst();
+                if (contact == null) {
+                    // Requests page is removed: for chatrooms and general usability,
+                    // accept messages from unknown senders if they provide a pubKeySpec.
+                    String pubKeySpec = td.getPubKeySpec();
+                    if (pubKeySpec == null || pubKeySpec.isEmpty()) {
+                        log("Contact not found with " + sender);
+                        return "" + CODE_CONTACT_NOT_FOUND;
+                    }
+                    Contact.addContact(
+                            mContext,
+                            sender,
+                            "",
+                            "",
+                            Util.base64decode(pubKeySpec),
+                            false,
+                            false
+                    );
+                    contact = realm.where(Contact.class).equalTo("address", sender).findFirst();
+                }
+                byte[] pubKey = contact.getPubKey();
+                String signature = td.getSignature();
 
             if (!td.getReceiver().equals(tor.getID())) {
                 log("message wrong address");
@@ -309,26 +379,160 @@ public class Server {
                 log("message invalid signature");
                 return "" + CODE_INVALID_SIGNATURE;
             }
-            log("message signature ok");
+                log("message signature ok");
 
             for (Listener l : mListeners) {
                 if (l != null) l.onChange();
             }
 
-            log("Trying to decrypt key: " + td.getSecretKey());
-            String key = tor.decryptByPrivateKey(td.getSecretKey());
-            AdvancedCrypto advancedCrypto = new AdvancedCrypto(key);
-            String data = advancedCrypto.decrypt(td.getData());
-            log("Decrypted Data: " + data);
-            Message message = gson.fromJson(data, Message.class);
+                log("Trying to decrypt key: " + td.getSecretKey());
+                String key = tor.decryptByPrivateKey(td.getSecretKey());
+                AdvancedCrypto advancedCrypto = new AdvancedCrypto(key);
+                String data = advancedCrypto.decrypt(td.getData());
+                log("Decrypted Data: " + data);
+                Message message = gson.fromJson(data, Message.class);
 
-            Message.addUnreadIncomingMessage(mContext, message);
-            if (message.getType() != Message.TYPE_TEXT) {
-                downloadFile(message);
+                // Chatrooms: keep membership in sync via room system messages.
+                if (message != null) {
+                    RoomMsg parsed = parseRoomMsg(message.getContent());
+
+                    // Preferred path: roommsg:<roomId>:<roomMessageId>:<type>:<base64>
+                    if (parsed != null) {
+                        final String roomId = parsed.roomId;
+                        final String systemType = parsed.systemType;
+                        final String systemPayload = parsed.payload;
+
+                        // Transport-level ACK: mark the matching outgoing message delivered and do not store/notify.
+                        if ("ACK".equals(systemType)) {
+                            final String myId = tor.getID();
+                            final String prefix = "roommsg:" + roomId + ":" + parsed.roomMessageId + ":";
+                            realm.executeTransaction(r -> {
+                                RealmResults<Message> outs = r.where(Message.class)
+                                        .equalTo("sender", myId)
+                                        .equalTo("receiver", sender)
+                                        .equalTo("pending", 1)
+                                        .beginsWith("content", prefix)
+                                        .findAll();
+                                for (Message m : outs) {
+                                    m.setPending(0);
+                                }
+                            });
+                            return "" + CODE_DATA_RECEIVED;
+                        }
+
+                        realm.executeTransaction(r -> {
+                            ChatRoom room = r.where(ChatRoom.class).equalTo("id", roomId).findFirst();
+                            if (room == null) {
+                                ChatRoom created = r.createObject(ChatRoom.class, roomId);
+                                created.setName("");
+                                created.setCreatedAt(System.currentTimeMillis());
+                                room = created;
+                            }
+
+                            if ("JOIN".equals(systemType)) {
+                                String pk = ChatRoomMember.makePrimaryKey(roomId, sender);
+                                ChatRoomMember member = r.where(ChatRoomMember.class).equalTo("primaryKey", pk).findFirst();
+                                if (member == null) {
+                                    ChatRoomMember m = r.createObject(ChatRoomMember.class, pk);
+                                    m.setRoomId(roomId);
+                                    m.setAddress(sender);
+                                    m.setAlias(systemPayload != null ? systemPayload.trim() : "");
+                                } else {
+                                    String existing = member.getAlias();
+                                    if ((existing == null || existing.trim().isEmpty()) && systemPayload != null) {
+                                        member.setAlias(systemPayload.trim());
+                                    }
+                                }
+                            }
+                        });
+                    } else if (message.getRoomId() != null && !message.getRoomId().isEmpty()) {
+                        // Secondary path: newer schema fields present.
+                        final String roomId = message.getRoomId();
+                        final String systemType = message.getRoomSystemType();
+                        final String systemPayload = message.getContent();
+
+                        if ("ACK".equals(systemType)) {
+                            final String myId = tor.getID();
+                            final String prefix = "roommsg:" + roomId + ":" + message.getRoomMessageId() + ":";
+                            realm.executeTransaction(r -> {
+                                RealmResults<Message> outs = r.where(Message.class)
+                                        .equalTo("sender", myId)
+                                        .equalTo("receiver", sender)
+                                        .equalTo("pending", 1)
+                                        .beginsWith("content", prefix)
+                                        .findAll();
+                                for (Message m : outs) {
+                                    m.setPending(0);
+                                }
+                            });
+                            return "" + CODE_DATA_RECEIVED;
+                        }
+
+                        realm.executeTransaction(r -> {
+                            ChatRoom room = r.where(ChatRoom.class).equalTo("id", roomId).findFirst();
+                            if (room == null) {
+                                ChatRoom created = r.createObject(ChatRoom.class, roomId);
+                                created.setName("");
+                                created.setCreatedAt(System.currentTimeMillis());
+                                room = created;
+                            }
+
+                            if ("JOIN".equals(systemType)) {
+                                String pk = ChatRoomMember.makePrimaryKey(roomId, sender);
+                                ChatRoomMember member = r.where(ChatRoomMember.class).equalTo("primaryKey", pk).findFirst();
+                                if (member == null) {
+                                    ChatRoomMember m = r.createObject(ChatRoomMember.class, pk);
+                                    m.setRoomId(roomId);
+                                    m.setAddress(sender);
+                                    m.setAlias(systemPayload != null ? systemPayload.trim() : "");
+                                } else {
+                                    String existing = member.getAlias();
+                                    if ((existing == null || existing.trim().isEmpty()) && systemPayload != null) {
+                                        member.setAlias(systemPayload.trim());
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+
+                // Room system frames like JOIN are state sync; don't store/notify them as chat messages.
+                if (message != null) {
+                    RoomMsg parsed = parseRoomMsg(message.getContent());
+                    if (parsed != null && "JOIN".equals(parsed.systemType)) {
+                        log("room JOIN received; not storing/notifying");
+                        return "" + CODE_DATA_RECEIVED;
+                    }
+                    if (message.getRoomId() != null && !message.getRoomId().isEmpty()) {
+                        String st = message.getRoomSystemType();
+                        if (st != null && "JOIN".equals(st)) {
+                            log("room JOIN (schema) received; not storing/notifying");
+                            return "" + CODE_DATA_RECEIVED;
+                        }
+                    }
+                }
+
+                Message.addUnreadIncomingMessage(mContext, message);
+
+                // For normal room messages (non-system), send an ACK back so the sender can stop retrying.
+                if (message != null) {
+                    RoomMsg parsed = parseRoomMsg(message.getContent());
+                    if (parsed != null) {
+                        String systemType = parsed.systemType;
+                        if (systemType == null || systemType.isEmpty() || "-".equals(systemType)) {
+                            String ack = encodeRoomMsg(parsed.roomId, parsed.roomMessageId, "ACK", "");
+                            Message.addPendingOutgoingMessage(tor.getID(), sender, ack, null, null, null);
+                            Client.getInstance(mContext).startSendPendingMessages(sender);
+                        }
+                    }
+                }
+
+                notifier.onMessage();
+                log("add ok");
+                return "" + CODE_DATA_RECEIVED;
+            } finally {
+                realm.close();
             }
-            notifier.onMessage();
-            log("add ok");
-            return "" + CODE_DATA_RECEIVED;
         }
         if ("newmsg".equals(tokens[0]) && tokens.length == 6) {
             String op = tokens[0];
@@ -387,6 +591,13 @@ public class Server {
                 Log.d(TAG, "onBindViewHolder: Download started for ID: " + dtid);
             }
         }
+    }
+
+    private static String encodeRoomMsg(String roomId, String roomMessageId, String systemType, String text) {
+        String typeToken = (systemType == null || systemType.isEmpty()) ? "-" : systemType;
+        String payload = text == null ? "" : text;
+        String encoded = Base64.encodeToString(payload.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
+        return "roommsg:" + roomId + ":" + roomMessageId + ":" + typeToken + ":" + encoded;
     }
 
     public com.liulishuo.filedownloader.FileDownloadListener fileDownloadListener = new com.liulishuo.filedownloader.FileDownloadListener() {

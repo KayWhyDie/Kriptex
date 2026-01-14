@@ -129,7 +129,6 @@ public class Contact extends RealmObject {
             contact.setOutgoing(outgoing ? 1 : 0);
             contact.setIncoming(incoming ? 1 : 0);
             realm.commitTransaction();
-            Database.getInstance(context).addNewRequest();
         }
         realm.close();
         return savedContact == null;

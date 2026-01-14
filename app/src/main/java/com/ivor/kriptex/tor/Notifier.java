@@ -27,7 +27,6 @@ import androidx.core.app.TaskStackBuilder;
 
 import com.ivor.kriptex.MainActivity;
 import com.ivor.kriptex.R;
-import com.ivor.kriptex.RequestActivity;
 import com.ivor.kriptex.db.Database;
 import com.ivor.kriptex.utils.Settings;
 import com.ivor.kriptex.utils.Util;
@@ -171,46 +170,4 @@ public class Notifier {
         notificationManager.notify(notificationId, mBuilder.build());
     }
 
-    public void showRequestNotification(String sender, String description) {
-        Intent intent = new Intent(context, RequestActivity.class);
-
-        NotificationManager notificationManager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
-
-        int notificationId = 6;
-        String channelId = "kriptex_request_01";
-        String channelName = "Kriptex Request";
-        int importance = NotificationManager.IMPORTANCE_HIGH;
-
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            NotificationChannel mChannel = new NotificationChannel(
-                    channelId, channelName, importance);
-            mChannel.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION), null);
-            notificationManager.createNotificationChannel(mChannel);
-        }
-
-        NotificationCompat.Builder mBuilder = new NotificationCompat.Builder(context, channelId)
-                .setSmallIcon(R.drawable.ic_stat_chat)
-                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-                .setContentTitle(sender)
-                .setContentText(description);
-
-        if (Settings.getPrefs(context).getBoolean("sound", true)) {
-            mBuilder.setDefaults(NotificationCompat.DEFAULT_SOUND);
-            mBuilder.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION));
-        }
-
-        TaskStackBuilder stackBuilder = TaskStackBuilder.create(context);
-        stackBuilder.addNextIntent(intent);
-        int pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            pendingFlags |= PendingIntent.FLAG_IMMUTABLE;
-        }
-        PendingIntent resultPendingIntent = stackBuilder.getPendingIntent(
-                0,
-            pendingFlags
-        );
-        mBuilder.setContentIntent(resultPendingIntent);
-
-        notificationManager.notify(notificationId, mBuilder.build());
-    }
 }

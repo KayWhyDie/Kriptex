@@ -101,6 +101,8 @@ public class ChatActivity extends AppCompatActivity {
     private Server mServer;
     private Contact mContact;
 
+    private Realm mContactRealm;
+
     public static final int REQUEST_PICK_FILE = 13;
 
     private RealmResults<Message> mMessages;
@@ -116,7 +118,6 @@ public class ChatActivity extends AppCompatActivity {
     private MenuItem mSelectedMenuItem;
 
     public static final int PR_WRITE_EXTERNAL_STORAGE = 10;
-    public static final int PR_RECORD_AUDIO = 11;
 
     private String mCurrentPhotoPath;
     private File mMediaFolder;
@@ -136,9 +137,22 @@ public class ChatActivity extends AppCompatActivity {
 
     private TextView txtFabCount;
 
+    private boolean useComposeChat() {
+        return true;
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        // Compose migration: chat UI is now implemented in ChatComposeActivity.
+        // Keep this Activity as a compatibility shim for any explicit intents.
+        if (useComposeChat()) {
+            startActivity(new Intent(this, ChatComposeActivity.class).setData(getIntent().getData()));
+            finish();
+            return;
+        }
+
         setContentView(R.layout.activity_chat);
         Toolbar toolbar = findViewById(R.id.toolbar);
         setSupportActionBar(toolbar);
@@ -163,13 +177,13 @@ public class ChatActivity extends AppCompatActivity {
 
         Log.i("ADDRESS", address);
 
-        Realm realm = Realm.getDefaultInstance();
-        mContact = realm.where(Contact.class).equalTo("address", address).findFirst();
+        mContactRealm = Realm.getDefaultInstance();
+        mContact = mContactRealm.where(Contact.class).equalTo("address", address).findFirst();
         if (mContact == null) {
             Toast.makeText(this, "Unable to find address: " + address, Toast.LENGTH_SHORT).show();
+            mContactRealm.close();
             finish();
         }
-        realm.close();
 
         mMediaFolder = new File(getFilesDir(), address);
         if (!mMediaFolder.exists()) {
@@ -244,11 +258,7 @@ public class ChatActivity extends AppCompatActivity {
                 txtFabCount.setText(null);
                 txtFabCount.setVisibility(View.GONE);
                 if (mContact.getPending() > 0) {
-                    Realm realm1 = Realm.getDefaultInstance();
-                    realm1.beginTransaction();
-                    mContact.setPending(0);
-                    realm1.commitTransaction();
-                    realm1.close();
+                    mContactRealm.executeTransaction(r -> mContact.setPending(0));
                 }
             } else {
                 if (mContact.getPending() > 0) {
@@ -271,11 +281,7 @@ public class ChatActivity extends AppCompatActivity {
                     ((FloatingActionButton) findViewById(R.id.fab)).hide();
                     txtFabCount.setVisibility(View.GONE);
                     if (mContact.getPending() > 0) {
-                        Realm realm = Realm.getDefaultInstance();
-                        realm.beginTransaction();
-                        mContact.setPending(0);
-                        realm.commitTransaction();
-                        realm.close();
+                        mContactRealm.executeTransaction(r -> mContact.setPending(0));
                         txtFabCount.setText(null);
                     }
                 } else if (dy < 0 && findViewById(R.id.fab).getVisibility() != View.VISIBLE && !shouldScroll()) {
@@ -335,17 +341,7 @@ public class ChatActivity extends AppCompatActivity {
         });
 
         final ImageButton audio = findViewById(R.id.audio);
-        audio.setOnClickListener(view -> {
-            if (ContextCompat.checkSelfPermission(ChatActivity.this, Manifest.permission.RECORD_AUDIO)
-                    != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(ChatActivity.this,
-                        new String[]{Manifest.permission.RECORD_AUDIO},
-                        PR_RECORD_AUDIO);
-                return;
-            }
-            TimerDialog dialog = new TimerDialog();
-            dialog.show(getSupportFragmentManager(), "Timer");
-        });
+        audio.setVisibility(View.GONE);
 
         txtFabCount = findViewById(R.id.txtFabCount);
 
@@ -497,34 +493,24 @@ public class ChatActivity extends AppCompatActivity {
         return super.onCreateOptionsMenu(menu);
     }
 
-    public void onAudioRecordComplete(String path) {
-        Log.d(TAG, "onAudioRecordComplete: " + path);
-        String sender = mTor.getID();
-        if (sender == null || sender.trim().equals("")) {
-            sendPendingAndUpdate();
-            return;
-        }
-        File file = new File(path);
-        String message = file.getName();
-        message = message.trim();
-        if (message.equals("")) return;
-        Message.addPendingOutgoingMessage(sender, address, message, file.getName(),
-                file.getAbsolutePath(),
-                FileServer.getMimeType(file.getAbsolutePath()),
-                Message.TYPE_AUDIO, null);
-        ((EditText) findViewById(R.id.txtMessage)).setText("");
-        sendPendingAndUpdate();
-        rep = 0;
-    }
-
     @Override
     protected void onDestroy() {
         super.onDestroy();
         Intent audioService = new Intent(this, AudioService.class);
         stopService(audioService);
-        mMessages.removeAllChangeListeners();
+        final RealmResults<Message> messages = mMessages;
+        if (messages != null) {
+            try {
+                messages.removeAllChangeListeners();
+            } catch (Exception ignored) {
+                // Best-effort cleanup; avoid crashing on teardown.
+            }
+        }
         if (mMessagesRealm != null && !mMessagesRealm.isClosed()) {
             mMessagesRealm.close();
+        }
+        if (mContactRealm != null && !mContactRealm.isClosed()) {
+            mContactRealm.close();
         }
     }
 
@@ -618,16 +604,6 @@ public class ChatActivity extends AppCompatActivity {
                 }
                 return;
             }
-            case PR_RECORD_AUDIO:
-                // If request is cancelled, the result arrays are empty.
-                if (grantResults.length > 0
-                        && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                    TimerDialog dialog = new TimerDialog();
-                    dialog.show(getSupportFragmentManager(), "Timer");
-                } else {
-                    Toast.makeText(this, "Record audio access denied", Toast.LENGTH_SHORT).show();
-                }
-                return;
         }
     }
 
@@ -793,11 +769,7 @@ public class ChatActivity extends AppCompatActivity {
 
         Notifier.getInstance(this).onResumeActivity();
 
-        Realm realm = Realm.getDefaultInstance();
-        realm.beginTransaction();
-        mContact.setPending(0);
-        realm.commitTransaction();
-        realm.close();
+        mContactRealm.executeTransaction(r -> mContact.setPending(0));
 
         ((TorStatusView) findViewById(R.id.torStatusView)).update();
 
@@ -873,11 +845,9 @@ public class ChatActivity extends AppCompatActivity {
 
     @Override
     protected void onPause() {
-        Realm realm = Realm.getDefaultInstance();
-        realm.beginTransaction();
-        mContact.setPending(0);
-        realm.commitTransaction();
-        realm.close();
+        if (mContact != null && mContact.isValid()) {
+            mContactRealm.executeTransaction(r -> mContact.setPending(0));
+        }
         Notifier.getInstance(this).onPauseActivity();
         timer.cancel();
         timer.purge();
