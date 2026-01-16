@@ -6,6 +6,7 @@ import android.util.Log;
 
 import com.ivor.kriptex.crypto.AdvancedCrypto;
 import com.ivor.kriptex.tor.Tor;
+import com.ivor.kriptex.utils.VisibleChatTracker;
 
 import java.io.File;
 import java.security.SecureRandom;
@@ -214,9 +215,20 @@ public class Message extends RealmObject {
         }
         realm.copyToRealm(message);
 
-        Contact contact = realm.where(Contact.class).equalTo("address", message.getSender()).findFirst();
-        contact.setPending(contact.getPending() + 1);
-        contact.setLastMessageTime(System.currentTimeMillis());
+        // Unread counters are per chat. Only bump Contact.pending for direct chats.
+        // Room messages are unread-tracked via ChatRoom.lastReadStableId, not contact.pending.
+        String roomId = message.getRoomId();
+        boolean isRoomMessage = roomId != null && !roomId.trim().isEmpty();
+        String chatId = isRoomMessage ? roomId : message.getSender();
+
+        boolean visible = chatId != null && VisibleChatTracker.isChatVisible(chatId);
+        if (!visible && !isRoomMessage) {
+            Contact contact = realm.where(Contact.class).equalTo("address", message.getSender()).findFirst();
+            if (contact != null) {
+                contact.setPending(contact.getPending() + 1);
+                contact.setLastMessageTime(System.currentTimeMillis());
+            }
+        }
         realm.commitTransaction();
         realm.close();
         return true;

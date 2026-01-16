@@ -22,6 +22,38 @@ public class Database extends SQLiteOpenHelper {
     private static Database instance;
     private Context context;
 
+    private static String normalizeOnionId(String value) {
+        if (value == null) return "";
+        String s = value.trim().toLowerCase();
+        if (s.endsWith(".onion")) s = s.substring(0, s.length() - ".onion".length());
+        return s;
+    }
+
+    private static boolean isBase32Like(String value) {
+        if (value == null || value.isEmpty()) return false;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            boolean ok = (c >= 'a' && c <= 'z') || (c >= '2' && c <= '7');
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    private static boolean looksLikeOnionPlaceholder(String existingName, String id) {
+        String n = normalizeOnionId(existingName);
+        String onion = normalizeOnionId(id);
+        if (n.isEmpty() || onion.isEmpty()) return false;
+
+        if (n.equals(onion)) return true;
+
+        int[] prefixes = new int[]{8, 16};
+        for (int len : prefixes) {
+            if (onion.length() >= len && n.equals(onion.substring(0, len))) return true;
+        }
+
+        return n.length() >= 8 && n.length() <= onion.length() && isBase32Like(n) && onion.startsWith(n);
+    }
+
     public Database(Context context) {
         super(context, "cdb", null, 1);
         this.context = context;
@@ -188,8 +220,24 @@ public class Database extends SQLiteOpenHelper {
         v.put("name", name);
         v.put("pending", 0);
         long n = getWritableDatabase().insertWithOnConflict("contacts", null, v, SQLiteDatabase.CONFLICT_IGNORE);
-        if (n >= 0) addNewRequest();
-        return n >= 0;
+        if (n >= 0) {
+            addNewRequest();
+            return true;
+        }
+
+        // Row already exists. If we now have a better name, backfill it.
+        if (name != null && !name.isEmpty()) {
+            String existing = getContactName(id);
+            String existingTrimmed = existing == null ? "" : existing.trim();
+            boolean existingLooksLikePlaceholder = !existingTrimmed.isEmpty() && looksLikeOnionPlaceholder(existingTrimmed, id);
+            if (existingTrimmed.isEmpty() || existingLooksLikePlaceholder) {
+                setContactName(id, name);
+                addNewRequest();
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public synchronized boolean addContact(String id, boolean outgoing, boolean incoming) {

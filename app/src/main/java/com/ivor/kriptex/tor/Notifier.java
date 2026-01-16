@@ -28,6 +28,7 @@ import androidx.core.app.TaskStackBuilder;
 import com.ivor.kriptex.MainActivity;
 import com.ivor.kriptex.R;
 import com.ivor.kriptex.db.Database;
+import com.ivor.kriptex.utils.VisibleChatTracker;
 import com.ivor.kriptex.utils.Settings;
 import com.ivor.kriptex.utils.Util;
 
@@ -60,35 +61,78 @@ public class Notifier {
 
     public synchronized void onMessage() {
         log("onMessage");
+        // Legacy entry-point (older code paths). Prefer onIncomingChatMessage(chatId).
         if (activities <= 0) {
             Database.getInstance(context).addNotification();
             update();
-        } else {
-            if (Settings.getPrefs(context).getBoolean("sound", true)) {
-                try {
-                    File toneDir = new File(context.getFilesDir(), "tones");
-                    if (!toneDir.exists()) toneDir.mkdir();
-                    File toneFile = new File(toneDir, "tone.ogg");
-                    Uri uri = Uri.fromFile(toneFile);
-                    if (!toneFile.exists())
-                        Util.copyAsset(context, "tones/tone.ogg", toneFile.getAbsolutePath());
-                    Ringtone r = RingtoneManager.getRingtone(context, uri);
-                    r.play();
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }
         }
     }
 
+    public synchronized void onIncomingChatMessage(String chatId) {
+        if (chatId == null || chatId.trim().isEmpty()) {
+            // Fallback: keep old global behavior.
+            onMessage();
+            return;
+        }
+
+        if (!Settings.getPrefs(context).getBoolean("notify", true)) return;
+        if (VisibleChatTracker.isChatVisible(chatId)) return;
+
+        int count = getChatNotificationCount(chatId) + 1;
+        setChatNotificationCount(chatId, count);
+        showChatNotification(chatId, count);
+    }
+
+    public synchronized void onChatVisible(String chatId) {
+        if (chatId == null || chatId.trim().isEmpty()) return;
+        setChatNotificationCount(chatId, 0);
+        cancelChatNotification(chatId);
+    }
+
     public synchronized void onResumeActivity() {
-        Database.getInstance(context).clearNotifications();
+        // Legacy lifecycle hook from pre-Compose Activities.
+        // Keep it for compatibility, but do not globally suppress notifications.
         activities++;
-        update();
     }
 
     public synchronized void onPauseActivity() {
         activities--;
+    }
+
+    private String chatNotifKey(String chatId) {
+        return "chat_notif_count_" + chatId.trim();
+    }
+
+    private int getChatNotificationCount(String chatId) {
+        return Settings.getPrefs(context).getInt(chatNotifKey(chatId), 0);
+    }
+
+    private void setChatNotificationCount(String chatId, int count) {
+        if (count < 0) count = 0;
+        Settings.getPrefs(context).edit().putInt(chatNotifKey(chatId), count).apply();
+    }
+
+    private int notificationIdForChat(String chatId) {
+        int h = chatId.trim().hashCode();
+        int positive = h & 0x7fffffff;
+        // Keep IDs in a small, non-conflicting range.
+        return 10000 + (positive % 50000);
+    }
+
+    private void cancelChatNotification(String chatId) {
+        NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+        nm.cancel(notificationIdForChat(chatId));
+    }
+
+    private void showChatNotification(String chatId, int count) {
+        String title = context.getResources().getString(R.string.app_name);
+        String body = context.getResources().getQuantityString(R.plurals.notification_new_messages, count, count);
+
+        Intent intent;
+        // Current app navigation is rooms-first; open MainActivity as a safe default.
+        intent = new Intent(context, MainActivity.class);
+
+        showNotification(context, title, body, intent, notificationIdForChat(chatId));
     }
 
     private void update() {
@@ -111,9 +155,11 @@ public class Notifier {
     }
 
     public void showNotification(Context context, String title, String body, Intent intent) {
-        NotificationManager notificationManager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+        showNotification(context, title, body, intent, 5);
+    }
 
-        int notificationId = 5;
+    public void showNotification(Context context, String title, String body, Intent intent, int notificationId) {
+        NotificationManager notificationManager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
         String channelId = "kriptex_message_01";
         String channelName = "Kriptex Message";
         int importance = NotificationManager.IMPORTANCE_HIGH;

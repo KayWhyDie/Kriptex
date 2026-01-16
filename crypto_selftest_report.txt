@@ -1,5 +1,5 @@
 Kriptex CryptoBox self-test
-timestamp_utc: 2026-01-14T19:38:58.801136600Z
+timestamp_utc: 2026-01-14T19:36:18.239254400Z
 case: bucket512
   payload_length: 1
   padded_bucket: 512

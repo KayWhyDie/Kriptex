@@ -41,6 +41,7 @@ import java.nio.charset.StandardCharsets;
 import android.util.Base64;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -225,6 +226,158 @@ public class Server {
             this.systemType = systemType;
             this.payload = payload;
         }
+    }
+
+    private static String normalizeOnionId(String value) {
+        if (value == null) return "";
+        String s = value.trim().toLowerCase(Locale.US);
+        if (s.endsWith(".onion")) s = s.substring(0, s.length() - ".onion".length());
+        return s;
+    }
+
+    private static boolean isBase32Like(String value) {
+        if (value == null || value.isEmpty()) return false;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            boolean ok = (c >= 'a' && c <= 'z') || (c >= '2' && c <= '7');
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    private static boolean looksLikeOnionPlaceholder(String existingName, String id) {
+        String n = normalizeOnionId(existingName);
+        String onion = normalizeOnionId(id);
+        if (n.isEmpty() || onion.isEmpty()) return false;
+
+        if (n.equals(onion)) return true;
+
+        int[] prefixes = new int[]{8, 16};
+        for (int len : prefixes) {
+            if (onion.length() >= len && n.equals(onion.substring(0, len))) return true;
+        }
+
+        return n.length() >= 8 && n.length() <= onion.length() && isBase32Like(n) && onion.startsWith(n);
+    }
+
+    private static boolean looksLikeHexToken(String value) {
+        if (value == null) return false;
+        String s = value.trim();
+        if (s.length() < 16) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            boolean ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    private static boolean looksLikeBase64Token(String value) {
+        if (value == null) return false;
+        String s = value.trim();
+        if (s.length() < 8 || s.length() > 256) return false;
+        if ((s.length() % 4) != 0) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            boolean ok = (c >= 'A' && c <= 'Z')
+                    || (c >= 'a' && c <= 'z')
+                    || (c >= '0' && c <= '9')
+                    || c == '+' || c == '/' || c == '=' || c == '-' || c == '_';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    private static String decodeBase64IfPrintableShort(String token) {
+        if (!looksLikeBase64Token(token)) return null;
+        try {
+            byte[] bytes = Base64.decode(token, Base64.DEFAULT);
+            if (bytes == null || bytes.length == 0 || bytes.length > 64) return null;
+            String decoded = new String(bytes, StandardCharsets.UTF_8).trim();
+            if (decoded.isEmpty() || decoded.length() > 32) return null;
+            boolean hasLetter = false;
+            for (int i = 0; i < decoded.length(); i++) {
+                char c = decoded.charAt(i);
+                if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') return null;
+                if (Character.isLetter(c)) hasLetter = true;
+            }
+            if (!hasLetter) return null;
+            if (looksLikeBase64Token(decoded) || looksLikeHexToken(decoded)) return null;
+            return decoded;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static boolean looksLikeKeyMaterialOrEncryptedName(String value) {
+        if (value == null) return false;
+        String s = value.trim();
+        if (s.isEmpty()) return false;
+        if (s.length() >= 40 && looksLikeBase64Token(s)) return true;
+        if (s.length() >= 40 && looksLikeHexToken(s)) return true;
+        return s.startsWith("AL3") && s.length() >= 40 && looksLikeBase64Token(s);
+    }
+
+    private static boolean looksLikeHumanAlias(String value) {
+        if (value == null) return false;
+        String s = value.trim();
+        if (s.isEmpty() || s.length() > 32) return false;
+        if (looksLikeBase64Token(s) || looksLikeHexToken(s)) return false;
+        boolean hasLetter = false;
+        for (int i = 0; i < s.length(); i++) {
+            if (Character.isLetter(s.charAt(i))) {
+                hasLetter = true;
+                break;
+            }
+        }
+        return hasLetter;
+    }
+
+    private static String normalizeAliasToken(String token) {
+        String t = token == null ? "" : token.trim();
+        String decoded = decodeBase64IfPrintableShort(t);
+        return decoded != null ? decoded : t;
+    }
+
+    private static String extractAddressFromPrimaryKey(String primaryKey, String roomId) {
+        if (primaryKey == null) return "";
+        String rid = roomId == null ? "" : roomId;
+        String prefix = rid + ":";
+        if (!rid.isEmpty() && primaryKey.startsWith(prefix)) {
+            return primaryKey.substring(prefix.length());
+        }
+        int idx = primaryKey.indexOf(':');
+        if (idx >= 0 && idx + 1 < primaryKey.length()) {
+            return primaryKey.substring(idx + 1);
+        }
+        return "";
+    }
+
+    private static ArrayList<ChatRoomMember> findRoomMemberCandidates(Realm r, String roomId, String senderNorm) {
+        ArrayList<ChatRoomMember> out = new ArrayList<>();
+        if (r == null) return out;
+        if (roomId == null || roomId.isEmpty()) return out;
+        if (senderNorm == null || senderNorm.isEmpty()) return out;
+
+        RealmResults<ChatRoomMember> members = r.where(ChatRoomMember.class)
+                .equalTo("roomId", roomId)
+                .findAll();
+        for (ChatRoomMember m : members) {
+            if (m == null) continue;
+            String addr = m.getAddress();
+            String addrNorm = normalizeOnionId(addr);
+            if (senderNorm.equals(addrNorm)) {
+                out.add(m);
+                continue;
+            }
+
+            String pkAddr = extractAddressFromPrimaryKey(m.getPrimaryKey(), roomId);
+            String pkAddrNorm = normalizeOnionId(pkAddr);
+            if (senderNorm.equals(pkAddrNorm)) {
+                out.add(m);
+            }
+        }
+        return out;
     }
 
     private RoomMsg parseRoomMsg(String content) {
@@ -430,17 +583,105 @@ public class Server {
                             }
 
                             if ("JOIN".equals(systemType)) {
-                                String pk = ChatRoomMember.makePrimaryKey(roomId, sender);
-                                ChatRoomMember member = r.where(ChatRoomMember.class).equalTo("primaryKey", pk).findFirst();
-                                if (member == null) {
-                                    ChatRoomMember m = r.createObject(ChatRoomMember.class, pk);
-                                    m.setRoomId(roomId);
-                                    m.setAddress(sender);
-                                    m.setAlias(systemPayload != null ? systemPayload.trim() : "");
+                                final String alias = normalizeAliasToken(systemPayload);
+                                final String senderRaw = sender == null ? "" : sender;
+                                final String senderRawLower = senderRaw.trim().toLowerCase(Locale.US);
+                                final String senderNorm = normalizeOnionId(senderRaw);
+
+                                String pkNorm = ChatRoomMember.makePrimaryKey(roomId, senderNorm);
+                                ArrayList<ChatRoomMember> candidates = findRoomMemberCandidates(r, roomId, senderNorm);
+
+                                ChatRoomMember canonical = r.where(ChatRoomMember.class)
+                                        .equalTo("primaryKey", pkNorm)
+                                        .findFirst();
+                                boolean created = false;
+                                if (canonical == null) {
+                                    canonical = r.createObject(ChatRoomMember.class, pkNorm);
+                                    canonical.setRoomId(roomId);
+                                    canonical.setAddress(senderNorm);
+                                    canonical.setAlias("");
+                                    created = true;
                                 } else {
-                                    String existing = member.getAlias();
-                                    if ((existing == null || existing.trim().isEmpty()) && systemPayload != null) {
-                                        member.setAlias(systemPayload.trim());
+                                    if (canonical.getRoomId() == null || canonical.getRoomId().isEmpty()) {
+                                        canonical.setRoomId(roomId);
+                                    }
+                                    String currentAddr = canonical.getAddress();
+                                    if (currentAddr == null || !normalizeOnionId(currentAddr).equals(senderNorm)) {
+                                        canonical.setAddress(senderNorm);
+                                    }
+                                }
+
+                                String bestAlias = normalizeAliasToken(canonical.getAlias());
+                                boolean bestBlank = bestAlias.isEmpty();
+                                boolean bestPlaceholder = !bestBlank && looksLikeOnionPlaceholder(bestAlias, senderNorm);
+                                boolean bestEncrypted = !bestBlank && looksLikeKeyMaterialOrEncryptedName(bestAlias);
+
+                                if (bestBlank || bestPlaceholder || bestEncrypted) {
+                                    for (ChatRoomMember m : candidates) {
+                                        if (m == null) continue;
+                                        String otherAlias = normalizeAliasToken(m.getAlias());
+                                        if (!otherAlias.isEmpty()
+                                                && !looksLikeOnionPlaceholder(otherAlias, senderNorm)
+                                                && !looksLikeKeyMaterialOrEncryptedName(otherAlias)) {
+                                            bestAlias = otherAlias;
+                                            bestBlank = false;
+                                            bestPlaceholder = false;
+                                            bestEncrypted = false;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if (!alias.isEmpty() && (bestBlank || bestPlaceholder || bestEncrypted)) {
+                                    bestAlias = alias;
+                                }
+
+                                if (!bestAlias.equals((canonical.getAlias() == null ? "" : canonical.getAlias()))) {
+                                    canonical.setAlias(bestAlias);
+                                }
+
+                                int deleted = 0;
+                                for (ChatRoomMember m : candidates) {
+                                    if (m == null) continue;
+                                    String pk = m.getPrimaryKey();
+                                    if (pk == null) continue;
+                                    if (!pkNorm.equals(pk)) {
+                                        m.deleteFromRealm();
+                                        deleted++;
+                                    }
+                                }
+
+                                String senderPrefixJoin = senderNorm.substring(0, Math.min(8, senderNorm.length()));
+                                if (created) {
+                                    log("room JOIN member created/migrated for " + senderPrefixJoin + " alias='" + alias + "'");
+                                }
+                                if (deleted > 0) {
+                                    log("room JOIN merged " + deleted + " duplicate member row(s) for " + senderPrefixJoin);
+                                }
+                                if (!alias.isEmpty() && bestAlias.equals(alias)) {
+                                    log("room JOIN alias set for " + senderPrefixJoin + " -> '" + alias + "'");
+                                }
+
+                                // Also backfill the sender's Contact name for UI fallbacks.
+                                if (!alias.isEmpty() && looksLikeHumanAlias(alias)) {
+                                    Contact senderContact = r.where(Contact.class)
+                                            .beginGroup()
+                                            .equalTo("address", senderNorm)
+                                            .or()
+                                            .equalTo("address", senderRawLower)
+                                            .endGroup()
+                                            .findFirst();
+                                    if (senderContact != null) {
+                                        String existing = senderContact.getName();
+                                        String existingTrimmed = existing == null ? "" : existing.trim();
+                                        boolean existingBlank = existingTrimmed.isEmpty();
+                                        boolean existingPlaceholder = !existingBlank && looksLikeOnionPlaceholder(existingTrimmed, senderNorm);
+                                        boolean existingEncrypted = !existingBlank && looksLikeKeyMaterialOrEncryptedName(existingTrimmed);
+                                        if (existingBlank || existingPlaceholder || existingEncrypted) {
+                                            senderContact.setName(alias);
+                                            String senderPrefix = senderNorm.substring(0, Math.min(8, senderNorm.length()));
+                                            log("room JOIN backfilled contact name for " + senderPrefix + " -> '" + alias + "'");
+                                        }
                                     }
                                 }
                             }
@@ -478,17 +719,104 @@ public class Server {
                             }
 
                             if ("JOIN".equals(systemType)) {
-                                String pk = ChatRoomMember.makePrimaryKey(roomId, sender);
-                                ChatRoomMember member = r.where(ChatRoomMember.class).equalTo("primaryKey", pk).findFirst();
-                                if (member == null) {
-                                    ChatRoomMember m = r.createObject(ChatRoomMember.class, pk);
-                                    m.setRoomId(roomId);
-                                    m.setAddress(sender);
-                                    m.setAlias(systemPayload != null ? systemPayload.trim() : "");
+                                final String alias = normalizeAliasToken(systemPayload);
+                                final String senderRaw = sender == null ? "" : sender;
+                                final String senderRawLower = senderRaw.trim().toLowerCase(Locale.US);
+                                final String senderNorm = normalizeOnionId(senderRaw);
+
+                                String pkNorm = ChatRoomMember.makePrimaryKey(roomId, senderNorm);
+                                ArrayList<ChatRoomMember> candidates = findRoomMemberCandidates(r, roomId, senderNorm);
+
+                                ChatRoomMember canonical = r.where(ChatRoomMember.class)
+                                        .equalTo("primaryKey", pkNorm)
+                                        .findFirst();
+                                boolean created = false;
+                                if (canonical == null) {
+                                    canonical = r.createObject(ChatRoomMember.class, pkNorm);
+                                    canonical.setRoomId(roomId);
+                                    canonical.setAddress(senderNorm);
+                                    canonical.setAlias("");
+                                    created = true;
                                 } else {
-                                    String existing = member.getAlias();
-                                    if ((existing == null || existing.trim().isEmpty()) && systemPayload != null) {
-                                        member.setAlias(systemPayload.trim());
+                                    if (canonical.getRoomId() == null || canonical.getRoomId().isEmpty()) {
+                                        canonical.setRoomId(roomId);
+                                    }
+                                    String currentAddr = canonical.getAddress();
+                                    if (currentAddr == null || !normalizeOnionId(currentAddr).equals(senderNorm)) {
+                                        canonical.setAddress(senderNorm);
+                                    }
+                                }
+
+                                String bestAlias = normalizeAliasToken(canonical.getAlias());
+                                boolean bestBlank = bestAlias.isEmpty();
+                                boolean bestPlaceholder = !bestBlank && looksLikeOnionPlaceholder(bestAlias, senderNorm);
+                                boolean bestEncrypted = !bestBlank && looksLikeKeyMaterialOrEncryptedName(bestAlias);
+
+                                if (bestBlank || bestPlaceholder || bestEncrypted) {
+                                    for (ChatRoomMember m : candidates) {
+                                        if (m == null) continue;
+                                        String otherAlias = normalizeAliasToken(m.getAlias());
+                                        if (!otherAlias.isEmpty()
+                                                && !looksLikeOnionPlaceholder(otherAlias, senderNorm)
+                                                && !looksLikeKeyMaterialOrEncryptedName(otherAlias)) {
+                                            bestAlias = otherAlias;
+                                            bestBlank = false;
+                                            bestPlaceholder = false;
+                                            bestEncrypted = false;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if (!alias.isEmpty() && (bestBlank || bestPlaceholder || bestEncrypted)) {
+                                    bestAlias = alias;
+                                }
+
+                                if (!bestAlias.equals((canonical.getAlias() == null ? "" : canonical.getAlias()))) {
+                                    canonical.setAlias(bestAlias);
+                                }
+
+                                int deleted = 0;
+                                for (ChatRoomMember m : candidates) {
+                                    if (m == null) continue;
+                                    String pk = m.getPrimaryKey();
+                                    if (pk == null) continue;
+                                    if (!pkNorm.equals(pk)) {
+                                        m.deleteFromRealm();
+                                        deleted++;
+                                    }
+                                }
+
+                                String senderPrefixJoin = senderNorm.substring(0, Math.min(8, senderNorm.length()));
+                                if (created) {
+                                    log("room JOIN (schema) member created/migrated for " + senderPrefixJoin + " alias='" + alias + "'");
+                                }
+                                if (deleted > 0) {
+                                    log("room JOIN (schema) merged " + deleted + " duplicate member row(s) for " + senderPrefixJoin);
+                                }
+                                if (!alias.isEmpty() && bestAlias.equals(alias)) {
+                                    log("room JOIN (schema) alias set for " + senderPrefixJoin + " -> '" + alias + "'");
+                                }
+
+                                if (!alias.isEmpty() && looksLikeHumanAlias(alias)) {
+                                    Contact senderContact = r.where(Contact.class)
+                                            .beginGroup()
+                                            .equalTo("address", senderNorm)
+                                            .or()
+                                            .equalTo("address", senderRawLower)
+                                            .endGroup()
+                                            .findFirst();
+                                    if (senderContact != null) {
+                                        String existing = senderContact.getName();
+                                        String existingTrimmed = existing == null ? "" : existing.trim();
+                                        boolean existingBlank = existingTrimmed.isEmpty();
+                                        boolean existingPlaceholder = !existingBlank && looksLikeOnionPlaceholder(existingTrimmed, senderNorm);
+                                        boolean existingEncrypted = !existingBlank && looksLikeKeyMaterialOrEncryptedName(existingTrimmed);
+                                        if (existingBlank || existingPlaceholder || existingEncrypted) {
+                                            senderContact.setName(alias);
+                                            String senderPrefix = senderNorm.substring(0, Math.min(8, senderNorm.length()));
+                                            log("room JOIN (schema) backfilled contact name for " + senderPrefix + " -> '" + alias + "'");
+                                        }
                                     }
                                 }
                             }
@@ -512,7 +840,10 @@ public class Server {
                     }
                 }
 
-                Message.addUnreadIncomingMessage(mContext, message);
+                boolean stored = false;
+                if (message != null) {
+                    stored = Message.addUnreadIncomingMessage(mContext, message);
+                }
 
                 // For normal room messages (non-system), send an ACK back so the sender can stop retrying.
                 if (message != null) {
@@ -527,7 +858,11 @@ public class Server {
                     }
                 }
 
-                notifier.onMessage();
+                if (stored && message != null) {
+                    String roomId = message.getRoomId();
+                    String chatId = (roomId != null && !roomId.isEmpty()) ? roomId : message.getSender();
+                    notifier.onIncomingChatMessage(chatId);
+                }
                 log("add ok");
                 return "" + CODE_DATA_RECEIVED;
             } finally {

@@ -5,9 +5,12 @@ import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.OpenableColumns
 import android.provider.MediaStore
 import android.media.ThumbnailUtils
+import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -46,8 +49,10 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableIntState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -57,9 +62,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import com.google.zxing.integration.android.IntentIntegrator
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import com.google.zxing.qrcode.encoder.Encoder
@@ -69,8 +78,10 @@ import com.ivor.kriptex.db.Contact
 import com.ivor.kriptex.db.Database
 import com.ivor.kriptex.db.Message
 import com.ivor.kriptex.utils.Util
+import com.ivor.kriptex.utils.VisibleChatTracker
 import com.ivor.kriptex.service.KriptexHostService
 import com.ivor.kriptex.tor.Client
+import com.ivor.kriptex.tor.Notifier
 import com.ivor.kriptex.tor.Server
 import com.ivor.kriptex.tor.Tor
 import com.ivor.kriptex.ui.compose.KriptexTheme
@@ -78,7 +89,10 @@ import io.realm.Realm
 import io.realm.RealmChangeListener
 import io.realm.RealmResults
 import io.realm.Sort
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.Locale
 import java.util.UUID
 
 class ChatRoomComposeActivity : AppCompatActivity() {
@@ -100,12 +114,26 @@ class ChatRoomComposeActivity : AppCompatActivity() {
     private var messages: RealmResults<Message>? = null
 
     private val messagesVersion: MutableIntState = mutableIntStateOf(0)
+    private val membersVersion: MutableIntState = mutableIntStateOf(0)
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var markRoomReadPosted: Boolean = false
+    private var markRoomReadInProgress: Boolean = false
 
     private val messagesListener = RealmChangeListener<RealmResults<Message>> {
         messagesVersion.intValue++
         if (isResumed) {
-            markRoomRead()
+            scheduleMarkRoomRead()
         }
+    }
+
+    private var lastJoinAnnounceElapsedMs: Long = 0L
+
+    private val membersListener = RealmChangeListener<RealmResults<ChatRoomMember>> {
+        membersVersion.intValue++
+        // Members are often discovered/created asynchronously (e.g., upon receiving a JOIN).
+        // Re-announce once we learn about members so they get our alias too.
+        maybeAnnounceJoinToMembers()
     }
 
     private var isResumed: Boolean = false
@@ -143,6 +171,7 @@ class ChatRoomComposeActivity : AppCompatActivity() {
         members = realm!!.where(ChatRoomMember::class.java)
             .equalTo("roomId", roomId)
             .findAll()
+        members!!.addChangeListener(membersListener)
 
         messagesRealm = Realm.getDefaultInstance()
         val prefix = roomContentPrefix(roomId)
@@ -171,6 +200,7 @@ class ChatRoomComposeActivity : AppCompatActivity() {
                     myId = tor.getID() ?: "",
                     myAlias = Database.getInstance(this).name,
                     members = members,
+                    membersVersion = membersVersion.intValue,
                     messages = messages,
                     messagesVersion = messagesVersion.intValue,
                     pendingSnackbarMessage = pendingSnackbarMessage,
@@ -191,45 +221,87 @@ class ChatRoomComposeActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacksAndMessages(null)
         messages?.removeAllChangeListeners()
+        members?.removeAllChangeListeners()
         realm?.close()
+        realm = null
         messagesRealm?.close()
+        messagesRealm = null
         super.onDestroy()
     }
 
     override fun onResume() {
         super.onResume()
         isResumed = true
-        markRoomRead()
+        scheduleMarkRoomRead()
     }
 
     override fun onPause() {
         isResumed = false
         // Persist last-read when leaving the room.
-        markRoomRead()
+        scheduleMarkRoomRead(force = true)
         super.onPause()
+    }
+
+    private fun scheduleMarkRoomRead(force: Boolean = false) {
+        if (!force && !isResumed) return
+        if (markRoomReadPosted) return
+
+        markRoomReadPosted = true
+        mainHandler.post {
+            markRoomReadPosted = false
+            markRoomRead()
+        }
     }
 
     private fun markRoomRead() {
         val r = realm ?: return
         val rid = roomId.trim()
         if (rid.isBlank()) return
-        val prefix = roomContentPrefix(rid)
-        r.executeTransaction { tx ->
-            val roomObj = tx.where(ChatRoom::class.java).equalTo("id", rid).findFirst() ?: return@executeTransaction
-            val maxStableId = tx.where(Message::class.java)
-                .beginGroup()
-                .equalTo("roomId", rid)
-                .or()
-                .beginsWith("content", prefix)
-                .endGroup()
-                .max("stableId")
-                ?.toLong()
-                ?: 0L
-            if (maxStableId > roomObj.lastReadStableId) {
-                roomObj.lastReadStableId = maxStableId
-            }
+
+        // Realm change listeners can be fired while a transaction is starting.
+        // Avoid re-entrant writes which crash with: "The Realm is already in a write transaction".
+        if (markRoomReadInProgress) return
+        try {
+            if (r.isInTransaction) return
+        } catch (_: IllegalStateException) {
+            // Realm may be closed/detached during teardown.
+            return
         }
+
+        val prefix = roomContentPrefix(rid)
+
+        markRoomReadInProgress = true
+        try {
+            r.executeTransaction { tx ->
+                val roomObj = tx.where(ChatRoom::class.java).equalTo("id", rid).findFirst() ?: return@executeTransaction
+                val maxStableId = tx.where(Message::class.java)
+                    .beginGroup()
+                    .equalTo("roomId", rid)
+                    .or()
+                    .beginsWith("content", prefix)
+                    .endGroup()
+                    .max("stableId")
+                    ?.toLong()
+                    ?: 0L
+                if (maxStableId > roomObj.lastReadStableId) {
+                    roomObj.lastReadStableId = maxStableId
+                }
+            }
+        } catch (_: IllegalStateException) {
+            // Ignore transient "already in a write transaction" edge cases.
+        } finally {
+            markRoomReadInProgress = false
+        }
+    }
+
+    private fun maybeAnnounceJoinToMembers() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        // Realm can deliver multiple callbacks in quick succession; keep JOIN traffic minimal.
+        if (now - lastJoinAnnounceElapsedMs < 1_500L) return
+        lastJoinAnnounceElapsedMs = now
+        announceJoinToMembers()
     }
 
     private fun handlePickedUri(uri: Uri?, fallbackType: Int) {
@@ -341,7 +413,7 @@ class ChatRoomComposeActivity : AppCompatActivity() {
         }
 
         for (addr in memberAddresses) {
-            val normalized = addr.trim().lowercase()
+            val normalized = addr.trim().lowercase(Locale.US)
             if (normalized.isBlank() || normalized == myId) continue
 
             var shouldStartKeyExchange = false
@@ -446,7 +518,7 @@ class ChatRoomComposeActivity : AppCompatActivity() {
 
         // Create one pending outgoing message per member.
         for (addr in memberAddresses) {
-            val normalized = addr.trim().lowercase()
+            val normalized = addr.trim().lowercase(Locale.US)
             if (normalized.isBlank() || normalized == myId) continue
 
             Realm.getDefaultInstance().use { r ->
@@ -494,7 +566,7 @@ class ChatRoomComposeActivity : AppCompatActivity() {
         var shouldStartKeyExchange = false
 
         for (addr in memberAddresses) {
-            val normalized = addr.trim().lowercase()
+            val normalized = addr.trim().lowercase(Locale.US)
             if (normalized.isBlank() || normalized == myId) continue
 
             Realm.getDefaultInstance().use { r ->
@@ -543,6 +615,7 @@ private fun RoomScreen(
     myId: String,
     myAlias: String?,
     members: RealmResults<ChatRoomMember>?,
+    membersVersion: Int,
     messages: RealmResults<Message>?,
     messagesVersion: Int,
     pendingSnackbarMessage: String?,
@@ -555,6 +628,8 @@ private fun RoomScreen(
     onSendText: (String) -> Unit,
     onDownloadMessage: (Message) -> Unit
 ) {
+        val debugLoggedFallbackKeys = remember { HashSet<String>() }
+        val debugTag = "ChatRoomUI"
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
@@ -582,18 +657,29 @@ private fun RoomScreen(
             }
     }
 
-    val otherMemberAddresses = remember(messagesVersion) {
-        (members?.mapNotNull { it.address } ?: emptyList())
-            .filter { it.isNotBlank() && it != myId }
+    val otherMemberAddresses = remember(membersVersion) {
+        val my = normalizeOnionId(myId)
+            (members?.mapNotNull {
+                val address = normalizeOnionId(it.address)
+                if (address.isNotBlank()) return@mapNotNull address
+                val pk = it.primaryKey?.trim().orEmpty()
+                val prefix = roomId + ":"
+                if (pk.startsWith(prefix) && pk.length > prefix.length) normalizeOnionId(pk.substring(prefix.length)) else null
+            } ?: emptyList())
+            .filter { it != my }
             .distinct()
             .sorted()
     }
 
-    val memberAliasByAddress = remember(messagesVersion) {
+    val memberAliasByAddress = remember(membersVersion) {
         (members?.toList() ?: emptyList())
             .mapNotNull { m ->
-                val addr = m.address?.trim()
-                if (addr.isNullOrBlank()) null else addr to (m.alias?.trim().orEmpty())
+                    val addr = normalizeOnionId(m.address).ifBlank {
+                        val pk = m.primaryKey?.trim().orEmpty()
+                        val prefix = roomId + ":"
+                        if (pk.startsWith(prefix) && pk.length > prefix.length) normalizeOnionId(pk.substring(prefix.length)) else ""
+                    }
+                if (addr.isBlank()) null else addr to (m.alias?.trim().orEmpty())
             }
             .toMap()
     }
@@ -618,11 +704,38 @@ private fun RoomScreen(
         },
         snackbarHost = { SnackbarHost(snackbarHostState) }
     ) { padding ->
+        val view = LocalView.current
+        var imeBottom by remember { mutableIntStateOf(0) }
+
+        DisposableEffect(view) {
+            ViewCompat.setOnApplyWindowInsetsListener(view) { _, insets ->
+                imeBottom = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+                insets
+            }
+            onDispose {
+                ViewCompat.setOnApplyWindowInsetsListener(view, null)
+            }
+        }
+
+        val isAtBottom by remember {
+            derivedStateOf {
+                val total = listState.layoutInfo.totalItemsCount
+                if (total <= 0) return@derivedStateOf true
+                val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                lastVisible >= total - 1
+            }
+        }
+
+        LaunchedEffect(imeBottom, deduped.size) {
+            if (imeBottom > 0 && isAtBottom) {
+                listState.scrollToItem((deduped.size - 1).coerceAtLeast(0))
+            }
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .imePadding()
         ) {
             LazyColumn(
                 modifier = Modifier
@@ -632,25 +745,90 @@ private fun RoomScreen(
                 state = listState
             ) {
                 items(deduped) { message ->
-                    val isMine = message.sender == myId
+                    val isMine = normalizeOnionId(message.sender) == normalizeOnionId(myId)
                     val lineColor = if (isMine) {
                         MaterialTheme.colorScheme.onSurface
                     } else {
                         MaterialTheme.colorScheme.primary
                     }
 
+
+    fun lookupMemberAlias(roomId: String, senderRaw: String, senderNorm: String): String? {
+        if (senderNorm.isBlank()) return null
+        return Realm.getDefaultInstance().use { r ->
+            val pkNorm = ChatRoomMember.makePrimaryKey(roomId, senderNorm)
+            val pkRaw = ChatRoomMember.makePrimaryKey(roomId, senderRaw.trim())
+            val member = r.where(ChatRoomMember::class.java)
+                .beginGroup()
+                .equalTo("primaryKey", pkNorm)
+                .or()
+                .equalTo("primaryKey", pkRaw)
+                .endGroup()
+                .findFirst()
+
+            val alias = member?.alias?.trim().orEmpty()
+            if (BuildConfig.DEBUG && member != null && alias.isBlank()) {
+                val pk = member.primaryKey ?: ""
+                val addr = member.address ?: ""
+                Log.w(
+                    debugTag,
+                    "member found but alias blank: roomId=$roomId senderRaw='${senderRaw}' senderNorm='${senderNorm}' pk='${pk}' addr='${addr}'"
+                )
+            }
+
+            alias.takeIf { it.isNotBlank() }
+        }
+    }
+
                     val alias = when {
                         isMine -> myAlias?.trim()?.takeIf { it.isNotBlank() } ?: "Anonymous"
                         else -> {
-                            val sender = message.sender ?: ""
-                            val roomAlias = memberAliasByAddress[sender]?.takeIf { it.isNotBlank() }
+                            val senderRaw = message.sender ?: ""
+                            val sender = normalizeOnionId(senderRaw)
+                            val roomAliasRaw = memberAliasByAddress[sender]
+                            val roomAlias = roomAliasRaw
+                                ?.let { normalizeAliasToken(it) }
+                                ?.takeIf { it.isNotBlank() && !looksLikeOnionPlaceholder(it, sender) && !looksLikeKeyMaterialOrEncryptedName(it) }
                             if (roomAlias != null) {
                                 roomAlias
                             } else {
-                            val contactName = Realm.getDefaultInstance().use { r ->
-                                r.where(Contact::class.java).equalTo("address", sender).findFirst()?.name
-                            }
-                            contactName?.takeIf { it.isNotBlank() } ?: sender.take(8)
+                                val memberAlias = lookupMemberAlias(roomId, senderRaw, sender)
+                                    ?.let { normalizeAliasToken(it) }
+                                    ?.takeIf { it.isNotBlank() && !looksLikeOnionPlaceholder(it, sender) && !looksLikeKeyMaterialOrEncryptedName(it) }
+                                if (memberAlias != null) {
+                                    memberAlias
+                                } else {
+                                val contactName = Realm.getDefaultInstance().use { r ->
+                                    val senderLookupA = sender
+                                    val senderLookupB = senderRaw.trim().lowercase(Locale.US)
+                                    r.where(Contact::class.java)
+                                        .beginGroup()
+                                        .equalTo("address", senderLookupA)
+                                        .or()
+                                        .equalTo("address", senderLookupB)
+                                        .endGroup()
+                                        .findFirst()
+                                        ?.name
+                                }
+                                val contactResolved = contactName
+                                    ?.let { normalizeAliasToken(it) }
+                                    ?.takeIf { it.isNotBlank() && !looksLikeOnionPlaceholder(it, sender) && !looksLikeKeyMaterialOrEncryptedName(it) }
+
+                                val resolved = contactResolved ?: sender.take(8)
+                                if (BuildConfig.DEBUG) {
+                                    val key = roomId + ":" + sender
+                                    if (debugLoggedFallbackKeys.add(key)) {
+                                        Log.w(
+                                            debugTag,
+                                            "name fallback: roomId=$roomId senderRaw='${senderRaw}' senderNorm='${sender}' " +
+                                                "membersSize=${members?.size ?: -1} membersVer=$membersVersion " +
+                                                "mapHit=${memberAliasByAddress.containsKey(sender)} mapAliasBlank=${roomAliasRaw.isNullOrBlank()} " +
+                                                "contactHit=${!contactName.isNullOrBlank()} contactIgnored=${contactName != null && contactResolved == null}"
+                                        )
+                                    }
+                                }
+                                resolved
+                                }
                             }
                         }
                     }
@@ -681,6 +859,7 @@ private fun RoomScreen(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .imePadding()
                     .navigationBarsPadding()
                     .padding(12.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -712,6 +891,35 @@ private fun RoomScreen(
                                 onPickFile()
                             }
                         )
+
+                        if (BuildConfig.DEBUG) {
+                            DropdownMenuItem(
+                                text = { Text("DEBUG: Dump aliases") },
+                                onClick = {
+                                    mediaMenuOpen = false
+                                    scope.launch {
+                                        val report = withContext(Dispatchers.IO) {
+                                            debugDumpRoomAliases(roomId)
+                                        }
+                                        Log.i(debugTag, report)
+                                        snackbarHostState.showSnackbar("Dumped aliases to logcat")
+                                    }
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("DEBUG: Self-heal aliases") },
+                                onClick = {
+                                    mediaMenuOpen = false
+                                    scope.launch {
+                                        val report = withContext(Dispatchers.IO) {
+                                            debugHealRoomAliases(roomId)
+                                        }
+                                        Log.w(debugTag, report)
+                                        snackbarHostState.showSnackbar("Self-heal done (see logcat)")
+                                    }
+                                }
+                            )
+                        }
                     }
                 }
                 TextField(
@@ -744,6 +952,236 @@ private fun extractRoomMessageIdFromContent(content: String?): String? {
     if (tokens.size != 5) return null
     if (tokens[0] != "roommsg") return null
     return tokens[2].takeIf { it.isNotBlank() }
+}
+
+private fun normalizeOnionId(value: String?): String {
+    val s = value?.trim()?.lowercase(Locale.US).orEmpty()
+    return if (s.endsWith(".onion")) s.dropLast(".onion".length) else s
+}
+
+private fun isBase32Like(value: String): Boolean {
+    if (value.isEmpty()) return false
+    for (c in value) {
+        val ok = (c in 'a'..'z') || (c in '2'..'7')
+        if (!ok) return false
+    }
+    return true
+}
+
+private fun looksLikeOnionPlaceholder(existingName: String?, id: String): Boolean {
+    val n = normalizeOnionId(existingName)
+    val onion = normalizeOnionId(id)
+    if (n.isBlank() || onion.isBlank()) return false
+    if (n == onion) return true
+
+    val prefixes = intArrayOf(8, 16)
+    for (len in prefixes) {
+        if (onion.length >= len && n == onion.substring(0, len)) return true
+    }
+
+    return n.length >= 8 && n.length <= onion.length && isBase32Like(n) && onion.startsWith(n)
+}
+
+private fun looksLikeHexToken(value: String): Boolean {
+    val s = value.trim()
+    if (s.length < 16) return false
+    for (c in s) {
+        val ok = (c in '0'..'9') || (c in 'a'..'f') || (c in 'A'..'F')
+        if (!ok) return false
+    }
+    return true
+}
+
+private fun looksLikeBase64Token(value: String): Boolean {
+    val s = value.trim()
+    if (s.length < 8 || s.length > 256) return false
+    if (s.length % 4 != 0) return false
+    for (c in s) {
+        val ok = (c in 'A'..'Z') || (c in 'a'..'z') || (c in '0'..'9') || c == '+' || c == '/' || c == '=' || c == '-' || c == '_'
+        if (!ok) return false
+    }
+    return true
+}
+
+private fun decodeBase64IfPrintableShort(token: String): String? {
+    if (!looksLikeBase64Token(token)) return null
+    return try {
+        val bytes = android.util.Base64.decode(token, android.util.Base64.DEFAULT)
+        if (bytes.isEmpty() || bytes.size > 64) return null
+        val decoded = bytes.toString(Charsets.UTF_8).trim()
+        if (decoded.isEmpty() || decoded.length > 32) return null
+
+        var hasLetter = false
+        for (c in decoded) {
+            if (c.code < 0x20 && c != '\n' && c != '\r' && c != '\t') return null
+            if (c.isLetter()) hasLetter = true
+        }
+        if (!hasLetter) return null
+        if (looksLikeBase64Token(decoded) || looksLikeHexToken(decoded)) return null
+        decoded
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun looksLikeKeyMaterialOrEncryptedName(value: String?): Boolean {
+    val s = value?.trim().orEmpty()
+    if (s.isBlank()) return false
+    if (s.length >= 40 && looksLikeBase64Token(s)) return true
+    if (s.length >= 40 && looksLikeHexToken(s)) return true
+    return s.startsWith("AL3") && s.length >= 40 && looksLikeBase64Token(s)
+}
+
+private fun looksLikeHumanAlias(value: String?): Boolean {
+    val s = value?.trim().orEmpty()
+    if (s.isBlank() || s.length > 32) return false
+    if (looksLikeBase64Token(s) || looksLikeHexToken(s)) return false
+    return s.any { it.isLetter() }
+}
+
+private fun normalizeAliasToken(token: String?): String {
+    val t = token?.trim().orEmpty()
+    return decodeBase64IfPrintableShort(t) ?: t
+}
+
+private fun debugDumpRoomAliases(roomId: String): String {
+    val sb = StringBuilder()
+    Realm.getDefaultInstance().use { r ->
+        val members = r.where(ChatRoomMember::class.java)
+            .equalTo("roomId", roomId)
+            .findAll()
+            .toList()
+            .filterNotNull()
+
+        sb.append("Room alias dump: roomId=").append(roomId)
+            .append(" members=").append(members.size)
+            .append('\n')
+
+        for (m in members) {
+            val pk = m.primaryKey?.trim().orEmpty()
+            val addr = normalizeOnionId(m.address)
+            val aliasRaw = m.alias?.trim().orEmpty()
+            val aliasNorm = normalizeAliasToken(aliasRaw)
+            val enc = looksLikeKeyMaterialOrEncryptedName(aliasNorm)
+            sb.append("- member pk='").append(pk)
+                .append("' addr='").append(addr)
+                .append("' aliasRaw='").append(aliasRaw)
+                .append("' aliasNorm='").append(aliasNorm)
+                .append("' encrypted=").append(enc)
+                .append('\n')
+
+            val c = r.where(Contact::class.java)
+                .beginGroup()
+                .equalTo("address", addr)
+                .or()
+                .equalTo("address", addr.lowercase(Locale.US))
+                .endGroup()
+                .findFirst()
+            if (c != null) {
+                val cnRaw = c.name?.trim().orEmpty()
+                val cn = normalizeAliasToken(cnRaw)
+                sb.append("  contact nameRaw='").append(cnRaw)
+                    .append("' nameNorm='").append(cn)
+                    .append("' encrypted=").append(looksLikeKeyMaterialOrEncryptedName(cn))
+                    .append('\n')
+            }
+        }
+    }
+    return sb.toString()
+}
+
+private fun debugHealRoomAliases(roomId: String): String {
+    var created = 0
+    var deleted = 0
+    var memberAliasUpdates = 0
+    var contactNameUpdates = 0
+
+    Realm.getDefaultInstance().use { r ->
+        val members = r.where(ChatRoomMember::class.java)
+            .equalTo("roomId", roomId)
+            .findAll()
+            .toList()
+            .filterNotNull()
+
+        // Group by normalized sender address (derived from address or PK).
+        val groups = members.groupBy { m ->
+            val addr = normalizeOnionId(m.address)
+            if (addr.isNotBlank()) return@groupBy addr
+            val pk = m.primaryKey?.trim().orEmpty()
+            val prefix = "$roomId:"
+            if (pk.startsWith(prefix) && pk.length > prefix.length) normalizeOnionId(pk.substring(prefix.length)) else ""
+        }.filterKeys { it.isNotBlank() }
+
+        r.executeTransaction { tr ->
+            for ((senderNorm, rows) in groups) {
+                val canonicalPk = ChatRoomMember.makePrimaryKey(roomId, senderNorm)
+                var canonical = tr.where(ChatRoomMember::class.java)
+                    .equalTo("primaryKey", canonicalPk)
+                    .findFirst()
+                if (canonical == null) {
+                    canonical = tr.createObject(ChatRoomMember::class.java, canonicalPk)
+                    canonical!!.roomId = roomId
+                    canonical!!.address = senderNorm
+                    canonical!!.alias = ""
+                    created++
+                } else {
+                    if (canonical!!.roomId.isNullOrBlank()) canonical!!.roomId = roomId
+                    if (normalizeOnionId(canonical!!.address) != senderNorm) canonical!!.address = senderNorm
+                }
+
+                val canonicalMember = canonical!!
+
+                fun isBadName(s: String): Boolean {
+                    val t = s.trim()
+                    return t.isBlank() || looksLikeOnionPlaceholder(t, senderNorm) || looksLikeKeyMaterialOrEncryptedName(t)
+                }
+
+                var bestAlias = normalizeAliasToken(canonicalMember.alias)
+                if (isBadName(bestAlias)) bestAlias = ""
+
+                for (m in rows.filterNotNull()) {
+                    val candidate = normalizeAliasToken(m.alias)
+                    if (!isBadName(candidate) && looksLikeHumanAlias(candidate)) {
+                        bestAlias = candidate
+                        break
+                    }
+                }
+
+                if (bestAlias.isNotBlank() && bestAlias != canonicalMember.alias) {
+                    canonicalMember.alias = bestAlias
+                    memberAliasUpdates++
+                }
+
+                for (m in rows.filterNotNull()) {
+                    val pk = m.primaryKey?.trim().orEmpty()
+                    if (pk.isNotBlank() && pk != canonicalPk) {
+                        m.deleteFromRealm()
+                        deleted++
+                    }
+                }
+
+                if (bestAlias.isNotBlank() && looksLikeHumanAlias(bestAlias)) {
+                    val c = tr.where(Contact::class.java)
+                        .beginGroup()
+                        .equalTo("address", senderNorm)
+                        .or()
+                        .equalTo("address", senderNorm.lowercase(Locale.US))
+                        .endGroup()
+                        .findFirst()
+                    if (c != null) {
+                        val existing = normalizeAliasToken(c.name)
+                        val existingBad = existing.isBlank() || looksLikeOnionPlaceholder(existing, senderNorm) || looksLikeKeyMaterialOrEncryptedName(existing)
+                        if (existingBad) {
+                            c.name = bestAlias
+                            contactNameUpdates++
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return "Self-heal aliases: roomId=$roomId created=$created deleted=$deleted memberAliasUpdates=$memberAliasUpdates contactNameUpdates=$contactNameUpdates"
 }
 
 private fun extractRoomTextFromContent(roomId: String, content: String?): String? {

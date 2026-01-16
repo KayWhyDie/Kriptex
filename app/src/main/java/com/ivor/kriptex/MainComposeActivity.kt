@@ -393,11 +393,18 @@ class MainComposeActivity : ComponentActivity() {
             return
         }
 
+        fun normalizeOnionId(value: String?): String {
+            val raw = (value ?: "").trim().lowercase(Locale.US)
+            return if (raw.endsWith(".onion")) raw.removeSuffix(".onion") else raw
+        }
+
+        val inviterNorm = normalizeOnionId(invite.inviterId)
+
         // Ensure we have the inviter as a contact so encryption works.
-        if (!Contact.hasContact(this, invite.inviterId)) {
+        if (!Contact.hasContact(this, inviterNorm)) {
             // Don't name the inviter contact as the room name.
             // We'll learn/display the inviter's alias via friend exchange or room membership.
-            addContact(invite.inviterId, "", "")
+            addContact(inviterNorm, "", "")
         }
 
         val realm = Realm.getDefaultInstance()
@@ -410,13 +417,30 @@ class MainComposeActivity : ComponentActivity() {
                     r.createdAt = System.currentTimeMillis()
                 }
 
-                val memberPk = ChatRoomMember.makePrimaryKey(invite.roomId, invite.inviterId)
-                val existingMember = tx.where(ChatRoomMember::class.java).equalTo("primaryKey", memberPk).findFirst()
+                val inviterRawLower = invite.inviterId.trim().lowercase(Locale.US)
+                val memberPkNorm = ChatRoomMember.makePrimaryKey(invite.roomId, inviterNorm)
+                val memberPkRaw = ChatRoomMember.makePrimaryKey(invite.roomId, inviterRawLower)
+                val existingMember = tx.where(ChatRoomMember::class.java)
+                    .beginGroup()
+                    .equalTo("primaryKey", memberPkNorm)
+                    .or()
+                    .equalTo("primaryKey", memberPkRaw)
+                    .endGroup()
+                    .findFirst()
+
                 if (existingMember == null) {
-                    val m = tx.createObject(ChatRoomMember::class.java, memberPk)
+                    val m = tx.createObject(ChatRoomMember::class.java, memberPkNorm)
                     m.roomId = invite.roomId
-                    m.address = invite.inviterId
+                    m.address = inviterNorm
                     m.alias = ""
+                } else {
+                    if (existingMember.roomId.isNullOrBlank()) {
+                        existingMember.roomId = invite.roomId
+                    }
+                    val currentAddr = existingMember.address ?: ""
+                    if (normalizeOnionId(currentAddr) != inviterNorm) {
+                        existingMember.address = inviterNorm
+                    }
                 }
             }
         } finally {

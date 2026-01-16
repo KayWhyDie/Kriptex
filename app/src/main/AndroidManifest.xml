@@ -142,6 +142,7 @@
             android:name=".ChatRoomComposeActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden"
             android:theme="@style/AppTheme.NoActionBar"
+            android:windowSoftInputMode="adjustResize"
             android:exported="false" />
 
         <service
