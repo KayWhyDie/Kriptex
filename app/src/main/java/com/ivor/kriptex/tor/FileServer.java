@@ -6,6 +6,7 @@ import android.util.Log;
 import android.webkit.MimeTypeMap;
 
 import com.ivor.kriptex.crypto.CryptoUtils;
+import com.ivor.kriptex.crypto.media.MediaAttachmentCrypto;
 import com.ivor.kriptex.db.FileShare;
 import com.ivor.kriptex.db.Message;
 
@@ -111,8 +112,45 @@ public class FileServer extends NanoHTTPD {
 
         File file;
         Map<String, String> headers = session.getHeaders();
-        Realm realm = Realm.getDefaultInstance();
         String fn = session.getUri().substring(1);
+        if (fn.startsWith("media/")) {
+            // Phase 3: chunked dumb blob host. Authorization is implicit via possession of the media key.
+            // Routes:
+            // - /media/{mediaId}/manifest
+            // - /media/{mediaId}/{chunkIndex}
+            String[] parts = fn.split("/");
+            if (parts.length != 3) {
+                return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/*", "" + FILE_NOT_FOUND);
+            }
+            String mediaId = parts[1];
+            String leaf = parts[2];
+            if (!isUuid(mediaId)) {
+                return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/*", "" + FILE_NOT_FOUND);
+            }
+
+            if ("manifest".equals(leaf)) {
+                file = MediaAttachmentCrypto.chunkedManifestFileForServing(mContext, mediaId);
+            } else {
+                int idx;
+                try {
+                    idx = Integer.parseInt(leaf);
+                } catch (NumberFormatException e) {
+                    return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/*", "" + FILE_NOT_FOUND);
+                }
+                if (idx < 0) {
+                    return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/*", "" + FILE_NOT_FOUND);
+                }
+                file = MediaAttachmentCrypto.chunkedChunkFileForServing(mContext, mediaId, idx);
+            }
+
+            if (!file.exists()) {
+                return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/*", "" + FILE_NOT_FOUND);
+            }
+            String mimeType = "application/octet-stream";
+            return serveFile(session.getUri(), session.getHeaders(), file, mimeType);
+        }
+
+        Realm realm = Realm.getDefaultInstance();
         String password = headers.get("password");
         Log.d(TAG, "serve: Trying to find file: " + fn);
         FileShare fileShare = realm.where(FileShare.class)
@@ -124,9 +162,43 @@ public class FileServer extends NanoHTTPD {
                 .sort("_id", Sort.DESCENDING).findFirst();
 
         if (fileShare != null && !fileShare.isServed()) {
-            file = new File(fileShare.getFilePath());
+            // Chunked attachments must be served via /media/... endpoints (no password auth).
+            if (fileShare.isChunked()) {
+                Log.d(TAG, "serve: Chunked attachment requested via legacy route: " + fn);
+                realm.close();
+                return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/*", "" + FILE_NOT_SERVABLE);
+            }
+            int configuredMax = fileShare.getMaxServeRequests();
+            int effectiveMax = configuredMax > 0 ? configuredMax : (fileShare.getMediaId() != null && !fileShare.getMediaId().trim().isEmpty() ? 64 : 32);
+            if (fileShare.getServeRequestCount() >= effectiveMax) {
+                Log.d(TAG, "serve: File password replay limit reached: " + fn);
+                realm.close();
+                return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/*", "" + FILE_NOT_SERVABLE);
+            }
+
+            // Legacy: serve plaintext filePath.
+            // E2EE: serve raw ciphertext from app-owned media dir keyed by mediaId.
+            if (fileShare.getMediaId() != null && !fileShare.getMediaId().trim().isEmpty()) {
+                String blobId = fileShare.getMediaBlobId();
+                if (blobId == null || blobId.trim().isEmpty()) blobId = fileShare.getMediaId();
+                file = MediaAttachmentCrypto.ciphertextFileForServing(mContext, blobId);
+            } else {
+                file = new File(fileShare.getFilePath());
+            }
             if (file.exists()) {
                 Log.d(TAG, "serve: File found serving: " + fileShare.getFilePath());
+
+                // Phase 2: bounded-use authorization semantics (best-effort, retry-tolerant).
+                // Increment once per HTTP request served.
+                long id = fileShare.get_id();
+                int maxFinal = effectiveMax;
+                realm.executeTransaction(r -> {
+                    FileShare fs = r.where(FileShare.class).equalTo("_id", id).findFirst();
+                    if (fs != null) {
+                        if (fs.getMaxServeRequests() <= 0) fs.setMaxServeRequests(maxFinal);
+                        fs.setServeRequestCount(fs.getServeRequestCount() + 1);
+                    }
+                });
             } else {
                 Log.d(TAG, "serve: File not found: " + fileShare.getFilePath());
                 realm.close();
@@ -141,6 +213,22 @@ public class FileServer extends NanoHTTPD {
         String mimeType = getMimeType(file.getAbsolutePath());
         response = serveFile(session.getUri(), session.getHeaders(), file, mimeType);
         return response;
+    }
+
+    private static boolean isUuid(String s) {
+        if (s == null) return false;
+        // Fast UUID v4-ish validation: 36 chars with hyphens at canonical positions.
+        if (s.length() != 36) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (i == 8 || i == 13 || i == 18 || i == 23) {
+                if (c != '-') return false;
+                continue;
+            }
+            boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
+        }
+        return true;
     }
 
     //Announce that the file server accepts partial content requests

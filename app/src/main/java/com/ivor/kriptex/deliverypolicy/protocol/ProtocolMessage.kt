@@ -22,6 +22,7 @@ sealed interface ProtocolMessage {
         SESSION_ACCEPT,
         SENDER_KEY_DISTRIBUTION,
         SENDER_KEY_GROUP_MESSAGE,
+        GROUP_MEDIA_KEY_DISTRIBUTION,
         UNKNOWN,
     }
 }
@@ -174,6 +175,43 @@ data class SenderKeyGroupMessage(
         require(senderIdentityPublicKey.size == 32) { "sender_identity_key_must_be_32_bytes" }
         require(senderKeyId > 0) { "non_positive_sender_key_id" }
         require(counter > 0) { "non_positive_counter" }
+        require(ciphertext.isNotEmpty()) { "missing_ciphertext" }
+    }
+}
+
+/**
+ * Phase 4: Sender-key group media key distribution.
+ *
+ * This message MUST be sent inside a 1:1 established session envelope (transport unchanged).
+ * The payload ciphertext is decrypted using the per-(groupId, senderIdentity) sender key ratchet.
+ *
+ * Plaintext (after sender-key decrypt) contains the 32-byte MediaKey bound to [mediaId].
+ */
+data class GroupMediaKeyDistributionMessage(
+    override val messageId: String,
+    override val conversationId: String,
+    override val createdAtElapsedMs: Long,
+    /** Opaque 32-byte group id. */
+    val groupId: ByteArray,
+    /** Sender Ed25519 identity public key (32 bytes). Must match the 1:1 session peer identity. */
+    val senderIdentityPublicKey: ByteArray,
+    /** Sender key id for this (groupId, sender). Monotonically increases on rotation. */
+    val senderKeyId: Long,
+    /** Sender message counter within this sender key id (starts at 1). */
+    val counter: Long,
+    /** Opaque media id (e.g., UUID string). */
+    val mediaId: String,
+    /** Sender-key AEAD ciphertext bytes (includes tag). */
+    val ciphertext: ByteArray,
+) : ProtocolMessage {
+    override val type: ProtocolMessage.Type = ProtocolMessage.Type.GROUP_MEDIA_KEY_DISTRIBUTION
+
+    init {
+        require(groupId.size == 32) { "group_id_must_be_32_bytes" }
+        require(senderIdentityPublicKey.size == 32) { "sender_identity_key_must_be_32_bytes" }
+        require(senderKeyId > 0) { "non_positive_sender_key_id" }
+        require(counter > 0) { "non_positive_counter" }
+        require(mediaId.isNotEmpty()) { "empty_media_id" }
         require(ciphertext.isNotEmpty()) { "missing_ciphertext" }
     }
 }

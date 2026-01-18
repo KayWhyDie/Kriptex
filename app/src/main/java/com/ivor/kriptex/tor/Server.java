@@ -19,12 +19,16 @@ import android.util.Log;
 import com.google.gson.Gson;
 import com.ivor.kriptex.BuildConfig;
 import com.ivor.kriptex.crypto.AdvancedCrypto;
+import com.ivor.kriptex.crypto.media.MediaAttachmentCrypto;
 import com.ivor.kriptex.db.ChatRoom;
 import com.ivor.kriptex.db.ChatRoomMember;
 import com.ivor.kriptex.db.Contact;
+import com.ivor.kriptex.db.FileShare;
 import com.ivor.kriptex.db.Message;
 import com.ivor.kriptex.db.TorData;
 import com.ivor.kriptex.db.TorRequest;
+import com.ivor.kriptex.tor.chunked.ChunkedMediaLimits;
+import com.ivor.kriptex.tor.chunked.RoundRobinMediaQueue;
 import com.ivor.kriptex.utils.Util;
 import com.liulishuo.filedownloader.BaseDownloadTask;
 import com.liulishuo.filedownloader.FileDownloader;
@@ -39,6 +43,7 @@ import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import android.util.Base64;
+import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Locale;
@@ -47,6 +52,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.realm.Realm;
 import io.realm.RealmResults;
+import io.realm.Sort;
 
 public class Server {
 
@@ -79,6 +85,12 @@ public class Server {
     public FileDownloadListener mFileDownloadListener;
     public Map<String, Integer> mDownloadProgress = new HashMap<>();
     public Map<String, BaseDownloadTask> mDownloadTasks = new HashMap<>();
+
+    // --- Phase 3.5: fairness + resource-bounding for chunked downloads ---
+    // Active mediaIds participating in the round-robin scheduler.
+    private final RoundRobinMediaQueue mChunkedMediaQueue = new RoundRobinMediaQueue();
+    // MediaIds with an in-flight manifest/chunk download task.
+    private final java.util.HashSet<String> mChunkedInFlightMediaIds = new java.util.HashSet<>();
 
     public Server(Context c) {
         mContext = c;
@@ -545,6 +557,24 @@ public class Server {
                 log("Decrypted Data: " + data);
                 Message message = gson.fromJson(data, Message.class);
 
+                // If this message carries an E2EE attachment, convert the media key to a local-wrapped form
+                // immediately (while the per-message key is available). This enables restore/offline decrypt.
+                if (message != null && message.getFileShare() != null) {
+                    FileShare fs = message.getFileShare();
+                    if (fs.getMediaId() != null && !fs.getMediaId().trim().isEmpty()) {
+                        byte[] transportWrapped = fs.getEncryptedMediaKey();
+                        if (transportWrapped == null || transportWrapped.length == 0) {
+                            throw new GeneralSecurityException("E2EE attachment missing encryptedMediaKey");
+                        }
+                        byte[] mediaKey = MediaAttachmentCrypto.unwrapMediaKeyFromTransport(transportWrapped, key, message, fs);
+                        byte[] deviceWrapped = MediaAttachmentCrypto.wrapMediaKeyForDevice(mediaKey, tor);
+                        fs.setEncryptedMediaKey(deviceWrapped);
+                        if (fs.getMediaAEAD() == null || fs.getMediaAEAD().trim().isEmpty()) {
+                            fs.setMediaAEAD(MediaAttachmentCrypto.AEAD_XCHACHA20_POLY1305);
+                        }
+                    }
+                }
+
                 // Chatrooms: keep membership in sync via room system messages.
                 if (message != null) {
                     RoomMsg parsed = parseRoomMsg(message.getContent());
@@ -906,21 +936,42 @@ public class Server {
     public void downloadFile(Message message) {
         File mediaFileDir = new File(mContext.getFilesDir(), message.getSender());
         File file = new File(mediaFileDir, message.getFileShare().getFilename());
-        String url = Message.getDownloadUrl(message);
         if (!file.exists()) {
-            if (!mDownloadTasks.containsKey(message.getPrimaryKey())) {
+            if (!hasActiveDownloadTaskForMessage(message.getPrimaryKey())) {
+                FileShare fs = message.getFileShare();
+                boolean isE2ee = fs != null && fs.getMediaId() != null && !fs.getMediaId().trim().isEmpty();
+                boolean isChunked = isE2ee && fs.isChunked();
+                if (isChunked) {
+                    startChunkedDownloadIfNeeded(message.getPrimaryKey(), true);
+                    return;
+                }
+
+                String url = Message.getDownloadUrl(message);
+                String downloadPath;
+                boolean isPathDir;
+                if (isE2ee) {
+                    // Phase 2: download ciphertext to a temp file; decrypt to the final path on completion.
+                    File tmpCipher = new File(mediaFileDir, fs.getFilename() + ".enc");
+                    downloadPath = tmpCipher.getAbsolutePath();
+                    isPathDir = false;
+                } else {
+                    downloadPath = mediaFileDir.toString();
+                    isPathDir = true;
+                }
+
                 BaseDownloadTask dt = FileDownloader.getImpl()
                         .create(url)
-                        .setPath(mediaFileDir.toString(), true)
-                        .addHeader("password", message.getFileShare().getPassword())
-//                        .addHeader("Connection", "close")
+                        .setPath(downloadPath, isPathDir)
+                        .addHeader("password", fs.getPassword())
                         .setCallbackProgressTimes(300)
                         .setAutoRetryTimes(3)
                         .setMinIntervalUpdateSpeed(2000)
                         .setTag(message.getPrimaryKey())
                         .setListener(fileDownloadListener);
 
-                mDownloadTasks.put(message.getPrimaryKey(), dt);
+                synchronized (mDownloadTasks) {
+                    mDownloadTasks.put(message.getPrimaryKey(), dt);
+                }
                 mDownloadProgress.put(message.getPrimaryKey(), -1);
                 int dtid = dt.start();
                 Log.d(TAG, "onBindViewHolder: Download started for ID: " + dtid);
@@ -939,7 +990,8 @@ public class Server {
         @Override
         protected void pending(BaseDownloadTask task, int soFarBytes, int totalBytes) {
             Log.d(TAG, "pending: " + task.getId());
-            String messageId = (String) task.getTag();
+            String tag = (String) task.getTag();
+            String messageId = extractMessageId(tag);
             if (mFileDownloadListener != null) {
                 mFileDownloadListener.onDownloadProgressChange(messageId);
             }
@@ -947,9 +999,16 @@ public class Server {
 
         @Override
         protected void progress(BaseDownloadTask task, int soFarBytes, int totalBytes) {
-            int progress = (int) (((double) soFarBytes / (double) totalBytes) * 100.f);
+            String tag = (String) task.getTag();
+            String messageId = extractMessageId(tag);
+
+            int progress;
+            if (isChunkedTaskTag(tag)) {
+                progress = computeChunkedProgressPercent(messageId);
+            } else {
+                progress = (int) (((double) soFarBytes / (double) totalBytes) * 100.f);
+            }
             Log.d(TAG, "progress: " + progress);
-            String messageId = (String) task.getTag();
             int oldProgress = -1;
             if (mDownloadProgress.containsKey(messageId)) {
                 oldProgress = mDownloadProgress.get(messageId);
@@ -963,10 +1022,36 @@ public class Server {
         @Override
         protected void completed(BaseDownloadTask task) {
             Log.d(TAG, "completed: " + task.getId());
-            String messageId = (String) task.getTag();
-            mDownloadTasks.remove(messageId);
-            mDownloadProgress.remove(messageId);
-            Message.updateDownloadStatus(messageId, true);
+            String tag = (String) task.getTag();
+            String messageId = extractMessageId(tag);
+            synchronized (mDownloadTasks) {
+                mDownloadTasks.remove(tag);
+                // Backward compatibility: legacy tasks use messageId as the key.
+                mDownloadTasks.remove(messageId);
+            }
+
+            boolean ok = true;
+            boolean threw = false;
+            try {
+                ok = handleDownloadCompleted(tag);
+            } catch (Throwable t) {
+                ok = false;
+                threw = true;
+                Log.e(TAG, "download decrypt failed", t);
+            }
+
+            if (isChunkedTaskTag(tag)) {
+                if (threw) {
+                    onChunkedTaskFailed(messageId);
+                } else {
+                    onChunkedTaskCompleted(messageId, ok);
+                }
+            }
+
+            if (ok) {
+                Message.updateDownloadStatus(messageId, true);
+                mDownloadProgress.put(messageId, 100);
+            }
             if (mFileDownloadListener != null) {
                 mFileDownloadListener.onDownloadProgressChange(messageId);
             }
@@ -975,9 +1060,15 @@ public class Server {
         @Override
         protected void paused(BaseDownloadTask task, int soFarBytes, int totalBytes) {
             Log.d(TAG, "paused: " + task.getId());
-            String messageId = (String) task.getTag();
-            mDownloadTasks.remove(messageId);
-            mDownloadProgress.remove(messageId);
+            String tag = (String) task.getTag();
+            String messageId = extractMessageId(tag);
+            synchronized (mDownloadTasks) {
+                mDownloadTasks.remove(tag);
+                mDownloadTasks.remove(messageId);
+            }
+            if (isChunkedTaskTag(tag)) {
+                onChunkedTaskFailed(messageId);
+            }
             if (mFileDownloadListener != null) {
                 mFileDownloadListener.onDownloadProgressChange(messageId);
             }
@@ -987,9 +1078,19 @@ public class Server {
         protected void error(BaseDownloadTask task, Throwable e) {
             Log.d(TAG, "error: " + task.getId() + " " + e.getLocalizedMessage());
             e.printStackTrace();
-            String messageId = (String) task.getTag();
-            mDownloadTasks.remove(messageId);
-            mDownloadProgress.remove(messageId);
+            String tag = (String) task.getTag();
+            String messageId = extractMessageId(tag);
+            synchronized (mDownloadTasks) {
+                mDownloadTasks.remove(tag);
+                mDownloadTasks.remove(messageId);
+            }
+            if (!isChunkedTaskTag(tag)) {
+                mDownloadProgress.remove(messageId);
+            }
+            markDownloadFailed(messageId);
+            if (isChunkedTaskTag(tag)) {
+                onChunkedTaskFailed(messageId);
+            }
             if (mFileDownloadListener != null) {
                 mFileDownloadListener.onDownloadProgressChange(messageId);
             }
@@ -1000,6 +1101,824 @@ public class Server {
             Log.d(TAG, "warn: " + task.getId());
         }
     };
+
+    private boolean handleDownloadCompleted(String taskTag) throws Exception {
+        String messageId = extractMessageId(taskTag);
+        if (messageId == null || messageId.trim().isEmpty()) return false;
+
+        if (!isChunkedTaskTag(taskTag)) {
+            return handleLegacyDownloadCompleted(messageId);
+        }
+
+        return handleChunkedDownloadCompleted(taskTag, messageId);
+    }
+
+    private boolean handleChunkedDownloadCompleted(String taskTag, String messageId) throws Exception {
+
+        Realm realm = Realm.getDefaultInstance();
+        try {
+            Message m = realm.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+            if (m == null || m.getFileShare() == null) {
+                return false;
+            }
+
+            FileShare fs = m.getFileShare();
+            if (fs.getMediaId() == null || fs.getMediaId().trim().isEmpty() || !fs.isChunked()) {
+                // Not a chunked E2EE attachment.
+                return false;
+            }
+
+            if (fs.getPlaintextSha256() == null || fs.getPlaintextSha256().length != 32) {
+                throw new GeneralSecurityException("missing_plaintext_hash");
+            }
+            if (fs.getChunkSize() <= 0 || fs.getTotalChunks() <= 0) {
+                throw new GeneralSecurityException("missing_chunk_params");
+            }
+
+            byte[] mediaKey = MediaAttachmentCrypto.unwrapMediaKeyFromDevice(fs.getEncryptedMediaKey(), Tor.getInstance(mContext));
+
+            String[] parts = taskTag.split("\\|");
+            String kind = parts.length >= 2 ? parts[1] : "";
+
+            if ("manifest".equals(kind)) {
+                File tmp = MediaAttachmentCrypto.chunkedManifestTempDownloadFile(mContext, fs.getMediaId());
+                if (!tmp.exists()) throw new IOException("manifest_tmp_missing");
+
+                // Phase 3.5: idempotent replay/dup defense.
+                // If already verified, avoid re-validating attacker-controlled ciphertext.
+                if (fs.isManifestVerified()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    tmp.delete();
+                    touchChunkedLastAccess(messageId);
+                    return false;
+                }
+
+                // Phase 3.5: cap validation / bitmap amplification defense.
+                ChunkedMediaLimits.validateOrThrow(fs.getFileSize(), fs.getChunkSize(), fs.getTotalChunks());
+
+                // Validate manifest ciphertext and fields.
+                MediaAttachmentCrypto.decryptAndValidateManifest(
+                        tmp,
+                        mediaKey,
+                        fs.getMediaId(),
+                        fs.getTotalChunks(),
+                        fs.getFileSize(),
+                        fs.getChunkSize(),
+                        fs.getPlaintextSha256());
+
+                File dst = MediaAttachmentCrypto.chunkedManifestFileForServing(mContext, fs.getMediaId());
+                //noinspection ResultOfMethodCallIgnored
+                dst.getParentFile().mkdirs();
+                //noinspection ResultOfMethodCallIgnored
+                dst.delete();
+                if (!tmp.renameTo(dst)) {
+                    moveReplace(tmp, dst);
+                    //noinspection ResultOfMethodCallIgnored
+                    tmp.delete();
+                }
+
+                realm.executeTransaction(r -> {
+                    Message mm = r.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+                    if (mm != null && mm.getFileShare() != null) {
+                        FileShare fss = mm.getFileShare();
+                        fss.setManifestVerified(true);
+                        fss.setChunkBitmap(ensureBitmapSize(fss.getChunkBitmap(), fss.getTotalChunks()));
+                        fss.setChunkedLastAccessMs(System.currentTimeMillis());
+                        fss.setChunkedEvictedAtMs(0);
+                        fss.setChunkedEvictReason("");
+                    }
+                });
+
+                return false;
+            }
+
+            if ("chunk".equals(kind) && parts.length >= 3) {
+                int chunkIndex = Integer.parseInt(parts[2]);
+                File tmp = MediaAttachmentCrypto.chunkedChunkTempDownloadFile(mContext, fs.getMediaId(), chunkIndex);
+                if (!tmp.exists()) throw new IOException("chunk_tmp_missing");
+
+                // Phase 3.5: cap validation / bitmap amplification defense.
+                ChunkedMediaLimits.validateOrThrow(fs.getFileSize(), fs.getChunkSize(), fs.getTotalChunks());
+
+                // Phase 3.5: idempotent replay/dup defense.
+                // If already verified and stored, avoid re-validating attacker-controlled ciphertext.
+                byte[] existingBitmap = ensureBitmapSize(fs.getChunkBitmap(), fs.getTotalChunks());
+                boolean already = isBitSet(existingBitmap, chunkIndex);
+                File existingCipher = MediaAttachmentCrypto.chunkedChunkFileForServing(mContext, fs.getMediaId(), chunkIndex);
+                if (already && existingCipher.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    tmp.delete();
+                    touchChunkedLastAccess(messageId);
+                    return false;
+                }
+
+                int expectedPlainLen = expectedChunkPlaintextLen(fs.getFileSize(), fs.getChunkSize(), fs.getTotalChunks(), chunkIndex);
+                MediaAttachmentCrypto.validateChunkCiphertext(
+                        tmp,
+                        mediaKey,
+                        fs.getMediaId(),
+                        chunkIndex,
+                        fs.getTotalChunks(),
+                        fs.getPlaintextSha256(),
+                        expectedPlainLen);
+
+                // Move temp into place unless already verified.
+                File dst = MediaAttachmentCrypto.chunkedChunkFileForServing(mContext, fs.getMediaId(), chunkIndex);
+                //noinspection ResultOfMethodCallIgnored
+                dst.getParentFile().mkdirs();
+                if (!already) {
+                    //noinspection ResultOfMethodCallIgnored
+                    dst.delete();
+                    if (!tmp.renameTo(dst)) {
+                        moveReplace(tmp, dst);
+                        //noinspection ResultOfMethodCallIgnored
+                        tmp.delete();
+                    }
+                } else {
+                    //noinspection ResultOfMethodCallIgnored
+                    tmp.delete();
+                }
+
+                // Update chunk bitmap (in-memory and in DB).
+                byte[] newBitmap = ensureBitmapSize(fs.getChunkBitmap(), fs.getTotalChunks());
+                setBit(newBitmap, chunkIndex);
+                realm.executeTransaction(r -> {
+                    Message mm = r.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+                    if (mm != null && mm.getFileShare() != null) {
+                        mm.getFileShare().setChunkBitmap(newBitmap);
+                        mm.getFileShare().setChunkedLastAccessMs(System.currentTimeMillis());
+                        mm.getFileShare().setChunkedEvictedAtMs(0);
+                        mm.getFileShare().setChunkedEvictReason("");
+                    }
+                });
+
+                // If all chunks are present, assemble into final plaintext.
+                if (isAllChunksVerified(newBitmap, fs.getTotalChunks())) {
+                    boolean assembled = assembleChunkedAttachment(m, fs, mediaKey);
+                    if (assembled) {
+                        realm.executeTransaction(r -> {
+                            Message mm = r.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+                            if (mm != null && mm.getFileShare() != null) {
+                                mm.getFileShare().setDownloadTried(true);
+                                mm.getFileShare().setDownloaded(true);
+                                mm.getFileShare().setChunkBitmap(null);
+                            }
+                        });
+                        return true;
+                    }
+                    return false;
+                }
+
+                return false;
+            }
+
+            throw new IllegalArgumentException("unknown_chunked_task_tag");
+        } catch (RuntimeException e) {
+            markDownloadFailed(messageId);
+            throw e;
+        } catch (Exception e) {
+            // Best-effort cleanup and mark failed.
+            markDownloadFailed(messageId);
+            throw e;
+        } finally {
+            realm.close();
+        }
+    }
+
+    private boolean handleLegacyDownloadCompleted(String messageId) throws Exception {
+        if (messageId == null || messageId.trim().isEmpty()) return false;
+
+        Realm realm = Realm.getDefaultInstance();
+        try {
+            Message m = realm.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+            if (m == null || m.getFileShare() == null) {
+                return false;
+            }
+
+            FileShare fs = m.getFileShare();
+            boolean isE2ee = fs.getMediaId() != null && !fs.getMediaId().trim().isEmpty();
+            if (!isE2ee) {
+                return true;
+            }
+
+            File mediaFileDir = new File(mContext.getFilesDir(), m.getSender());
+            File tmpCipher = new File(mediaFileDir, fs.getFilename() + ".enc");
+            File outPlain = new File(mediaFileDir, fs.getFilename());
+            File tmpPlain = new File(mediaFileDir, fs.getFilename() + ".dec");
+
+            // Retry-safe fast-path: if plaintext already exists and matches the expected hash,
+            // treat as success and clean up any leftover ciphertext temp.
+            if (outPlain.exists()) {
+                if (fs.getPlaintextSha256() != null && fs.getPlaintextSha256().length == 32) {
+                    byte[] actualExisting = MediaAttachmentCrypto.sha256File(outPlain);
+                    if (java.util.Arrays.equals(actualExisting, fs.getPlaintextSha256())) {
+                        //noinspection ResultOfMethodCallIgnored
+                        tmpCipher.delete();
+                        realm.executeTransaction(r -> {
+                            Message mm = r.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+                            if (mm != null && mm.getFileShare() != null) {
+                                mm.getFileShare().setDownloadTried(true);
+                                mm.getFileShare().setDownloaded(true);
+                            }
+                        });
+                        return true;
+                    } else {
+                        // Stale/incorrect plaintext: remove and re-decrypt.
+                        //noinspection ResultOfMethodCallIgnored
+                        outPlain.delete();
+                    }
+                } else if (fs.isDownloaded()) {
+                    // Backward compatibility: Phase 1 attachments didn't bind a plaintext hash.
+                    // If previously marked downloaded and file exists, assume it is correct.
+                    //noinspection ResultOfMethodCallIgnored
+                    tmpCipher.delete();
+                    return true;
+                }
+            }
+
+            // Safety: require ciphertext temp and do not leave partially-decrypted plaintext behind on failure.
+            if (!tmpCipher.exists()) {
+                throw new IOException("ciphertext temp missing");
+            }
+
+            // Ensure no stale temp plaintext remains.
+            //noinspection ResultOfMethodCallIgnored
+            tmpPlain.delete();
+
+            byte[] mediaKey = MediaAttachmentCrypto.unwrapMediaKeyFromDevice(fs.getEncryptedMediaKey(), Tor.getInstance(mContext));
+            byte[] aad;
+            if (fs.getPlaintextSha256() != null && fs.getPlaintextSha256().length == 32) {
+                aad = MediaAttachmentCrypto.buildAadV2(fs.getMediaId(), fs.getMimeType(), fs.getFileSize(), fs.getPlaintextSha256());
+            } else {
+                // Backward compatibility: Phase 1 attachments didn't bind a plaintext hash.
+                aad = MediaAttachmentCrypto.buildAad(fs.getMediaId(), fs.getMimeType(), fs.getFileSize());
+            }
+
+            // Decrypt to a temp file first, then move into place on success.
+            MediaAttachmentCrypto.decryptCiphertextToFile(tmpCipher, tmpPlain, mediaKey, aad);
+
+            // Phase 2 hardening: verify plaintext hash if present.
+            if (fs.getPlaintextSha256() != null && fs.getPlaintextSha256().length == 32) {
+                byte[] actual = MediaAttachmentCrypto.sha256File(tmpPlain);
+                if (!java.util.Arrays.equals(actual, fs.getPlaintextSha256())) {
+                    //noinspection ResultOfMethodCallIgnored
+                    tmpPlain.delete();
+                    throw new GeneralSecurityException("plaintext_hash_mismatch");
+                }
+            }
+
+            // Replace any existing plaintext (best-effort) and move temp into final location.
+            //noinspection ResultOfMethodCallIgnored
+            outPlain.delete();
+            if (!tmpPlain.renameTo(outPlain)) {
+                moveReplace(tmpPlain, outPlain);
+                //noinspection ResultOfMethodCallIgnored
+                tmpPlain.delete();
+            }
+
+            // Delete ciphertext temp after successful decrypt.
+            //noinspection ResultOfMethodCallIgnored
+            tmpCipher.delete();
+
+            realm.executeTransaction(r -> {
+                Message mm = r.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+                if (mm != null && mm.getFileShare() != null) {
+                    mm.getFileShare().setDownloadTried(true);
+                    mm.getFileShare().setDownloaded(true);
+                }
+            });
+
+            return true;
+        } finally {
+            realm.close();
+        }
+    }
+
+    private static String extractMessageId(String taskTag) {
+        if (taskTag == null) return null;
+        int pipe = taskTag.indexOf('|');
+        if (pipe <= 0) return taskTag;
+        return taskTag.substring(0, pipe);
+    }
+
+    private static boolean isChunkedTaskTag(String taskTag) {
+        if (taskTag == null) return false;
+        String[] parts = taskTag.split("\\|");
+        if (parts.length < 2) return false;
+        return "manifest".equals(parts[1]) || "chunk".equals(parts[1]);
+    }
+
+    private boolean hasActiveDownloadTaskForMessage(String messageId) {
+        if (messageId == null || messageId.trim().isEmpty()) return false;
+        synchronized (mDownloadTasks) {
+            return mDownloadTasks.containsKey(messageId);
+        }
+    }
+
+    private void startChunkedDownloadIfNeeded(String messageId) {
+        startChunkedDownloadIfNeeded(messageId, false);
+    }
+
+    private void startChunkedDownloadIfNeeded(String messageId, boolean userInitiated) {
+        if (messageId == null || messageId.trim().isEmpty()) return;
+
+        // Phase 3.5: round-robin fairness across mediaIds + bounded concurrency.
+        registerChunkedMessageForScheduling(messageId, userInitiated);
+        pumpChunkedDownloads();
+    }
+
+    private void onChunkedTaskCompleted(String messageId, boolean isFinalSuccess) {
+        String mediaId = lookupChunkedMediaIdForMessage(messageId);
+        if (mediaId != null) {
+            mChunkedInFlightMediaIds.remove(mediaId);
+        }
+
+        if (!isFinalSuccess) {
+            // Continue this media under fairness, but only after completion processing finished.
+            startChunkedDownloadIfNeeded(messageId);
+            return;
+        }
+
+        if (mediaId != null) {
+            mChunkedMediaQueue.remove(mediaId);
+        }
+        pumpChunkedDownloads();
+    }
+
+    private void onChunkedTaskFailed(String messageId) {
+        String mediaId = lookupChunkedMediaIdForMessage(messageId);
+        if (mediaId != null) {
+            mChunkedInFlightMediaIds.remove(mediaId);
+            // Avoid immediate retry loops; user action re-enqueues.
+            mChunkedMediaQueue.remove(mediaId);
+        }
+        pumpChunkedDownloads();
+    }
+
+    private String lookupChunkedMediaIdForMessage(String messageId) {
+        if (messageId == null || messageId.trim().isEmpty()) return null;
+        Realm realm = Realm.getDefaultInstance();
+        try {
+            Message m = realm.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+            if (m == null || m.getFileShare() == null) return null;
+            if (!m.getFileShare().isChunked()) return null;
+            String mediaId = m.getFileShare().getMediaId();
+            if (mediaId == null || mediaId.trim().isEmpty()) return null;
+            return mediaId;
+        } finally {
+            realm.close();
+        }
+    }
+
+    private void registerChunkedMessageForScheduling(String messageId, boolean userInitiated) {
+        Realm realm = Realm.getDefaultInstance();
+        try {
+            Message m = realm.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+            if (m == null || m.getFileShare() == null) return;
+            FileShare fs = m.getFileShare();
+            if (!fs.isChunked()) return;
+            String mediaId = fs.getMediaId();
+            if (mediaId == null || mediaId.trim().isEmpty()) return;
+
+            // Explicit user retry clears eviction markers (internal scheduling does not).
+            if (userInitiated && fs.getChunkedEvictedAtMs() > 0) {
+                realm.executeTransaction(r -> {
+                    Message mm = r.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+                    if (mm != null && mm.getFileShare() != null) {
+                        FileShare fss = mm.getFileShare();
+                        fss.setChunkedEvictedAtMs(0);
+                        fss.setChunkedEvictReason("");
+                    }
+                });
+            }
+            mChunkedMediaQueue.offer(mediaId);
+            touchChunkedLastAccess(messageId);
+        } finally {
+            realm.close();
+        }
+    }
+
+    private void pumpChunkedDownloads() {
+        Realm realm = Realm.getDefaultInstance();
+        try {
+            enforceChunkedIncompleteEntriesLimit(realm);
+
+            while (mChunkedInFlightMediaIds.size() < ChunkedMediaLimits.MAX_CONCURRENT_CHUNKED_TASKS) {
+                String mediaId = mChunkedMediaQueue.next(mChunkedInFlightMediaIds);
+                if (mediaId == null) return;
+
+                Message m = realm.where(Message.class)
+                        .equalTo("fileShare.mediaId", mediaId)
+                        .equalTo("fileShare.chunked", true)
+                        .equalTo("fileShare.isDownloaded", false)
+                        .findFirst();
+                if (m == null || m.getFileShare() == null) {
+                    mChunkedMediaQueue.remove(mediaId);
+                    continue;
+                }
+
+                FileShare fs = m.getFileShare();
+                String messageId = m.getPrimaryKey();
+                String sender = m.getSender();
+
+                // Phase 3.5: do not auto-resume evicted partial downloads.
+                if (fs.getChunkedEvictedAtMs() > 0) {
+                    mChunkedMediaQueue.remove(mediaId);
+                    continue;
+                }
+
+                // If this message already has an active task, don't start another.
+                if (hasActiveDownloadTaskForMessage(messageId)) {
+                    continue;
+                }
+
+                try {
+                    if (fs.getPlaintextSha256() == null || fs.getPlaintextSha256().length != 32) {
+                        throw new IllegalArgumentException("missing_plaintext_hash");
+                    }
+                    ChunkedMediaLimits.validateOrThrow(fs.getFileSize(), fs.getChunkSize(), fs.getTotalChunks());
+                } catch (RuntimeException cap) {
+                    Log.w(TAG, "chunked caps reject: " + cap.getMessage());
+                    markChunkedDownloadRejected(messageId, mediaId, cap.getMessage());
+                    mChunkedMediaQueue.remove(mediaId);
+                    continue;
+                }
+
+                String tag;
+                String url;
+                String path;
+
+                if (!fs.isManifestVerified()) {
+                    tag = messageId + "|manifest";
+                    url = "https://" + sender + ".onion:" + Tor.getFileServerPort() + "/media/" + mediaId + "/manifest";
+                    path = MediaAttachmentCrypto.chunkedManifestTempDownloadFile(mContext, mediaId).getAbsolutePath();
+                } else {
+                    byte[] bitmap = ensureBitmapSize(fs.getChunkBitmap(), fs.getTotalChunks());
+                    int next = findNextMissingChunkIndex(bitmap, fs.getTotalChunks());
+                    if (next < 0) {
+                        // No more chunks to fetch; attempt to assemble offline.
+                        try {
+                            byte[] mediaKey = MediaAttachmentCrypto.unwrapMediaKeyFromDevice(fs.getEncryptedMediaKey(), Tor.getInstance(mContext));
+                            if (assembleChunkedAttachment(m, fs, mediaKey)) {
+                                Message.updateDownloadStatus(messageId, true);
+                                mDownloadProgress.put(messageId, 100);
+                                mChunkedMediaQueue.remove(mediaId);
+                            }
+                        } catch (Throwable t) {
+                            Log.w(TAG, "chunked offline assemble failed", t);
+                        }
+                        continue;
+                    }
+                    tag = messageId + "|chunk|" + next;
+                    url = "https://" + sender + ".onion:" + Tor.getFileServerPort() + "/media/" + mediaId + "/" + next;
+                    path = MediaAttachmentCrypto.chunkedChunkTempDownloadFile(mContext, mediaId, next).getAbsolutePath();
+                }
+
+                BaseDownloadTask dt = FileDownloader.getImpl()
+                        .create(url)
+                        .setPath(path, false)
+                        .setCallbackProgressTimes(300)
+                        .setAutoRetryTimes(3)
+                        .setMinIntervalUpdateSpeed(2000)
+                        .setTag(tag)
+                        .setListener(fileDownloadListener);
+
+                synchronized (mDownloadTasks) {
+                    mDownloadTasks.put(tag, dt);
+                    mDownloadTasks.put(messageId, dt);
+                }
+
+                mChunkedInFlightMediaIds.add(mediaId);
+                touchChunkedLastAccess(messageId);
+
+                if (!mDownloadProgress.containsKey(messageId)) {
+                    mDownloadProgress.put(messageId, computeChunkedProgressPercent(messageId));
+                }
+                dt.start();
+            }
+        } finally {
+            realm.close();
+        }
+    }
+
+    private void enforceChunkedIncompleteEntriesLimit(Realm realm) {
+        if (realm == null) return;
+
+        RealmResults<FileShare> results = realm.where(FileShare.class)
+                .equalTo("chunked", true)
+                .equalTo("isDownloaded", false)
+                .findAll()
+                .sort("chunkedLastAccessMs", Sort.ASCENDING);
+
+        int over = results.size() - ChunkedMediaLimits.MAX_INCOMPLETE_ENTRIES;
+        if (over <= 0) return;
+
+        long now = System.currentTimeMillis();
+
+        for (int i = 0; i < results.size() && over > 0; i++) {
+            FileShare fs = results.get(i);
+            if (fs == null) continue;
+            String mediaId = fs.getMediaId();
+            if (mediaId == null || mediaId.trim().isEmpty()) continue;
+            if (mChunkedInFlightMediaIds.contains(mediaId)) continue;
+
+            // Best-effort evict ciphertext artifacts and reset DB state for all rows sharing this mediaId.
+            evictChunkedArtifacts(mediaId, fs.getTotalChunks());
+
+            final long evictedAt = now;
+            final String reason = "lru_evicted";
+            realm.executeTransaction(r -> {
+                RealmResults<Message> msgs = r.where(Message.class)
+                        .equalTo("fileShare.mediaId", mediaId)
+                        .equalTo("fileShare.chunked", true)
+                        .findAll();
+                for (Message mm : msgs) {
+                    if (mm == null || mm.getFileShare() == null) continue;
+                    FileShare fss = mm.getFileShare();
+                    fss.setManifestVerified(false);
+                    fss.setChunkBitmap(null);
+                    fss.setDownloadTried(true);
+                    fss.setDownloaded(false);
+                    fss.setChunkedEvictedAtMs(evictedAt);
+                    fss.setChunkedEvictReason(reason);
+                    fss.setChunkedLastAccessMs(evictedAt);
+                }
+            });
+
+            mChunkedMediaQueue.remove(mediaId);
+            over--;
+        }
+    }
+
+    private void markChunkedDownloadRejected(String messageId, String mediaId, String reason) {
+        if (messageId == null || messageId.trim().isEmpty()) return;
+        if (mediaId == null || mediaId.trim().isEmpty()) return;
+        evictChunkedArtifacts(mediaId, -1);
+
+        Realm realm = Realm.getDefaultInstance();
+        try {
+            long now = System.currentTimeMillis();
+            final String r = (reason == null || reason.trim().isEmpty()) ? "rejected" : reason;
+            realm.executeTransaction(tx -> {
+                Message mm = tx.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+                if (mm != null && mm.getFileShare() != null) {
+                    FileShare fs = mm.getFileShare();
+                    fs.setManifestVerified(false);
+                    fs.setChunkBitmap(null);
+                    fs.setDownloadTried(true);
+                    fs.setDownloaded(false);
+                    fs.setChunkedEvictedAtMs(now);
+                    fs.setChunkedEvictReason(r);
+                    fs.setChunkedLastAccessMs(now);
+                }
+            });
+        } finally {
+            realm.close();
+        }
+    }
+
+    private void touchChunkedLastAccess(String messageId) {
+        if (messageId == null || messageId.trim().isEmpty()) return;
+        Realm realm = Realm.getDefaultInstance();
+        try {
+            long now = System.currentTimeMillis();
+            realm.executeTransaction(r -> {
+                Message mm = r.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+                if (mm != null && mm.getFileShare() != null && mm.getFileShare().isChunked()) {
+                    mm.getFileShare().setChunkedLastAccessMs(now);
+                }
+            });
+        } finally {
+            realm.close();
+        }
+    }
+
+    private void evictChunkedArtifacts(String mediaId, int totalChunksHint) {
+        if (mediaId == null || mediaId.trim().isEmpty()) return;
+
+        //noinspection ResultOfMethodCallIgnored
+        MediaAttachmentCrypto.chunkedManifestFileForServing(mContext, mediaId).delete();
+        //noinspection ResultOfMethodCallIgnored
+        MediaAttachmentCrypto.chunkedManifestTempDownloadFile(mContext, mediaId).delete();
+
+        int limit = totalChunksHint;
+        if (limit < 0) {
+            // If unknown, use our global cap.
+            limit = ChunkedMediaLimits.MAX_TOTAL_CHUNKS;
+        }
+        for (int i = 0; i < limit; i++) {
+            //noinspection ResultOfMethodCallIgnored
+            MediaAttachmentCrypto.chunkedChunkFileForServing(mContext, mediaId, i).delete();
+            //noinspection ResultOfMethodCallIgnored
+            MediaAttachmentCrypto.chunkedChunkTempDownloadFile(mContext, mediaId, i).delete();
+        }
+    }
+
+    private int computeChunkedProgressPercent(String messageId) {
+        if (messageId == null || messageId.trim().isEmpty()) return -1;
+        Realm realm = Realm.getDefaultInstance();
+        try {
+            Message m = realm.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+            if (m == null || m.getFileShare() == null) return -1;
+            FileShare fs = m.getFileShare();
+            if (!fs.isChunked() || fs.getTotalChunks() <= 0) return -1;
+            int total = 1 + fs.getTotalChunks();
+            int done = (fs.isManifestVerified() ? 1 : 0) + countVerifiedChunks(fs.getChunkBitmap(), fs.getTotalChunks());
+            int pct = (int) Math.floor(((double) done / (double) total) * 100.0);
+            if (pct < 0) pct = 0;
+            if (pct > 99) pct = 99;
+            return pct;
+        } finally {
+            realm.close();
+        }
+    }
+
+    private static byte[] ensureBitmapSize(byte[] existing, int totalChunks) {
+        if (totalChunks <= 0) return new byte[0];
+        int need = (totalChunks + 7) / 8;
+        if (existing != null && existing.length == need) return existing;
+        byte[] out = new byte[need];
+        if (existing != null) {
+            System.arraycopy(existing, 0, out, 0, Math.min(existing.length, out.length));
+        }
+        return out;
+    }
+
+    private static boolean isBitSet(byte[] bitmap, int index) {
+        if (bitmap == null || index < 0) return false;
+        int byteIndex = index / 8;
+        int bitIndex = index % 8;
+        if (byteIndex < 0 || byteIndex >= bitmap.length) return false;
+        return (bitmap[byteIndex] & (1 << bitIndex)) != 0;
+    }
+
+    private static void setBit(byte[] bitmap, int index) {
+        if (bitmap == null || index < 0) return;
+        int byteIndex = index / 8;
+        int bitIndex = index % 8;
+        if (byteIndex < 0 || byteIndex >= bitmap.length) return;
+        bitmap[byteIndex] = (byte) (bitmap[byteIndex] | (1 << bitIndex));
+    }
+
+    private static int countVerifiedChunks(byte[] bitmap, int totalChunks) {
+        if (totalChunks <= 0) return 0;
+        if (bitmap == null || bitmap.length == 0) return 0;
+        int count = 0;
+        for (int i = 0; i < totalChunks; i++) {
+            if (isBitSet(bitmap, i)) count++;
+        }
+        return count;
+    }
+
+    private static int findNextMissingChunkIndex(byte[] bitmap, int totalChunks) {
+        if (totalChunks <= 0) return -1;
+        byte[] bm = ensureBitmapSize(bitmap, totalChunks);
+        for (int i = 0; i < totalChunks; i++) {
+            if (!isBitSet(bm, i)) return i;
+        }
+        return -1;
+    }
+
+    private static boolean isAllChunksVerified(byte[] bitmap, int totalChunks) {
+        return countVerifiedChunks(bitmap, totalChunks) == totalChunks;
+    }
+
+    private static int expectedChunkPlaintextLen(long totalPlaintextSize, int chunkSize, int totalChunks, int chunkIndex) {
+        if (chunkSize <= 0) throw new IllegalArgumentException("chunkSize <= 0");
+        if (totalPlaintextSize < 0) throw new IllegalArgumentException("totalPlaintextSize < 0");
+        if (totalChunks <= 0) throw new IllegalArgumentException("totalChunks <= 0");
+        if (chunkIndex < 0 || chunkIndex >= totalChunks) throw new IllegalArgumentException("chunkIndex out of range");
+        long start = (long) chunkIndex * (long) chunkSize;
+        long remaining = totalPlaintextSize - start;
+        if (remaining < 0) throw new IllegalArgumentException("chunkIndex beyond plaintext size");
+        return (int) Math.min((long) chunkSize, remaining);
+    }
+
+    private boolean assembleChunkedAttachment(Message message, FileShare fs, byte[] mediaKey32) throws Exception {
+        if (message == null || fs == null) return false;
+        if (!fs.isChunked()) return false;
+        if (fs.getMediaId() == null || fs.getMediaId().trim().isEmpty()) return false;
+        if (fs.getPlaintextSha256() == null || fs.getPlaintextSha256().length != 32) return false;
+        if (fs.getTotalChunks() <= 0 || fs.getChunkSize() <= 0) return false;
+
+        byte[] bitmap = ensureBitmapSize(fs.getChunkBitmap(), fs.getTotalChunks());
+        if (!isAllChunksVerified(bitmap, fs.getTotalChunks())) return false;
+
+        File mediaFileDir = new File(mContext.getFilesDir(), message.getSender());
+        //noinspection ResultOfMethodCallIgnored
+        mediaFileDir.mkdirs();
+        File outPlain = new File(mediaFileDir, fs.getFilename());
+        File tmpPlain = new File(mediaFileDir, fs.getFilename() + ".dec");
+
+        // Ensure no stale temp plaintext remains.
+        //noinspection ResultOfMethodCallIgnored
+        tmpPlain.delete();
+
+        try (java.io.OutputStream os = new java.io.BufferedOutputStream(new java.io.FileOutputStream(tmpPlain, false))) {
+            for (int i = 0; i < fs.getTotalChunks(); i++) {
+                File chunkFile = MediaAttachmentCrypto.chunkedChunkFileForServing(mContext, fs.getMediaId(), i);
+                if (!chunkFile.exists()) {
+                    throw new IOException("missing_chunk_file_" + i);
+                }
+                MediaAttachmentCrypto.decryptChunkToStream(
+                        chunkFile,
+                        os,
+                        mediaKey32,
+                        fs.getMediaId(),
+                        i,
+                        fs.getTotalChunks(),
+                        fs.getPlaintextSha256());
+            }
+            os.flush();
+        }
+
+        byte[] actual = MediaAttachmentCrypto.sha256File(tmpPlain);
+        if (!java.util.Arrays.equals(actual, fs.getPlaintextSha256())) {
+            //noinspection ResultOfMethodCallIgnored
+            tmpPlain.delete();
+            throw new GeneralSecurityException("plaintext_hash_mismatch");
+        }
+
+        // Replace any existing plaintext and move temp into final location.
+        //noinspection ResultOfMethodCallIgnored
+        outPlain.delete();
+        if (!tmpPlain.renameTo(outPlain)) {
+            moveReplace(tmpPlain, outPlain);
+            //noinspection ResultOfMethodCallIgnored
+            tmpPlain.delete();
+        }
+
+        // Best-effort cleanup of chunked ciphertext artifacts after success.
+        //noinspection ResultOfMethodCallIgnored
+        MediaAttachmentCrypto.chunkedManifestFileForServing(mContext, fs.getMediaId()).delete();
+        //noinspection ResultOfMethodCallIgnored
+        MediaAttachmentCrypto.chunkedManifestTempDownloadFile(mContext, fs.getMediaId()).delete();
+        for (int i = 0; i < fs.getTotalChunks(); i++) {
+            //noinspection ResultOfMethodCallIgnored
+            MediaAttachmentCrypto.chunkedChunkFileForServing(mContext, fs.getMediaId(), i).delete();
+            //noinspection ResultOfMethodCallIgnored
+            MediaAttachmentCrypto.chunkedChunkTempDownloadFile(mContext, fs.getMediaId(), i).delete();
+        }
+
+        return true;
+    }
+
+    private void markDownloadFailed(String messageId) {
+        if (messageId == null || messageId.trim().isEmpty()) return;
+        Realm realm = Realm.getDefaultInstance();
+        try {
+            realm.executeTransaction(r -> {
+                Message mm = r.where(Message.class).equalTo("primaryKey", messageId).findFirst();
+                if (mm != null && mm.getFileShare() != null) {
+                    FileShare fs = mm.getFileShare();
+                    fs.setDownloadTried(true);
+                    fs.setDownloaded(false);
+
+                    // Phase 3.5: if chunked, delete ciphertext artifacts and reset state.
+                    if (fs.isChunked() && fs.getMediaId() != null && !fs.getMediaId().trim().isEmpty()) {
+                        String mediaId = fs.getMediaId();
+                        int totalChunks = fs.getTotalChunks();
+                        evictChunkedArtifacts(mediaId, totalChunks);
+                        fs.setManifestVerified(false);
+                        fs.setChunkBitmap(null);
+                        fs.setChunkedEvictReason("failed");
+                    }
+
+                    // Try to delete any leftover temp/final file.
+                    File mediaFileDir = new File(mContext.getFilesDir(), mm.getSender());
+                    File tmpCipher = new File(mediaFileDir, fs.getFilename() + ".enc");
+                    File outPlain = new File(mediaFileDir, fs.getFilename());
+                    File tmpPlain = new File(mediaFileDir, fs.getFilename() + ".dec");
+                    //noinspection ResultOfMethodCallIgnored
+                    tmpCipher.delete();
+                    //noinspection ResultOfMethodCallIgnored
+                    outPlain.delete();
+                    //noinspection ResultOfMethodCallIgnored
+                    tmpPlain.delete();
+                }
+            });
+        } finally {
+            realm.close();
+        }
+    }
+
+    private static void moveReplace(File src, File dst) throws IOException {
+        if (src == null || dst == null) return;
+        File parent = dst.getParentFile();
+        if (parent != null && !parent.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            parent.mkdirs();
+        }
+        try (java.io.InputStream in = new java.io.FileInputStream(src);
+             java.io.OutputStream out = new java.io.FileOutputStream(dst, false)) {
+            byte[] buf = new byte[8192];
+            int r;
+            while ((r = in.read(buf)) != -1) {
+                out.write(buf, 0, r);
+            }
+            out.flush();
+        }
+    }
 
     private void handle(InputStream is, OutputStream os) throws Exception {
         BufferedReader r = new BufferedReader(new InputStreamReader(is));

@@ -19,6 +19,7 @@ import kotlin.math.max
  *   - ack: ackedMessageId len(u32) + utf8
  *   - sender_key_distribution: groupId bytes, senderIdentity bytes, senderKeyId i64, senderChainKey bytes
  *   - sender_key_group_message: groupId bytes, senderIdentity bytes, senderKeyId i64, counter i64, ciphertext bytes
+ *   - group_media_key_distribution: groupId bytes, senderIdentity bytes, senderKeyId i64, counter i64, mediaId len(u32)+utf8, ciphertext bytes
  *   - unknown: typeName len(u32)+utf8, payload len(u32)+payload
  */
 class BinaryProtocolCodec : ProtocolEncoder, ProtocolDecoder {
@@ -129,6 +130,26 @@ class BinaryProtocolCodec : ProtocolEncoder, ProtocolDecoder {
                     putBytes(buf, message.senderIdentityPublicKey)
                     buf.putLong(message.senderKeyId)
                     buf.putLong(message.counter)
+                    putBytes(buf, message.ciphertext)
+                }
+            }
+
+            is GroupMediaKeyDistributionMessage -> {
+                val mediaIdBytes = message.mediaId.encodeToByteArray()
+                typeByte = 8
+                extraSize =
+                    (4 + message.groupId.size) +
+                    (4 + message.senderIdentityPublicKey.size) +
+                    8 +
+                    8 +
+                    (4 + mediaIdBytes.size) +
+                    (4 + message.ciphertext.size)
+                writeExtra = { buf ->
+                    putBytes(buf, message.groupId)
+                    putBytes(buf, message.senderIdentityPublicKey)
+                    buf.putLong(message.senderKeyId)
+                    buf.putLong(message.counter)
+                    putUtf8(buf, mediaIdBytes)
                     putBytes(buf, message.ciphertext)
                 }
             }
@@ -291,6 +312,26 @@ class BinaryProtocolCodec : ProtocolEncoder, ProtocolDecoder {
                     senderIdentityPublicKey = senderIdentity,
                     senderKeyId = senderKeyId,
                     counter = counter,
+                    ciphertext = ciphertext,
+                )
+            }
+
+            8 -> {
+                val groupId = readBytes(buf)
+                val senderIdentity = readBytes(buf)
+                val senderKeyId = readLong(buf)
+                val counter = readLong(buf)
+                val mediaId = readUtf8(buf)
+                val ciphertext = readBytes(buf)
+                GroupMediaKeyDistributionMessage(
+                    messageId = messageId,
+                    conversationId = conversationId,
+                    createdAtElapsedMs = createdAt,
+                    groupId = groupId,
+                    senderIdentityPublicKey = senderIdentity,
+                    senderKeyId = senderKeyId,
+                    counter = counter,
+                    mediaId = mediaId,
                     ciphertext = ciphertext,
                 )
             }

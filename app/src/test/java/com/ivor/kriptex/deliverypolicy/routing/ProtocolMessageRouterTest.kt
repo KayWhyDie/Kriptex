@@ -3,6 +3,7 @@ package com.ivor.kriptex.deliverypolicy.routing
 import com.ivor.kriptex.deliverypolicy.outbox.EnqueueResult
 import com.ivor.kriptex.deliverypolicy.protocol.AckMessage
 import com.ivor.kriptex.deliverypolicy.protocol.BinaryProtocolCodec
+import com.ivor.kriptex.deliverypolicy.protocol.GroupMediaKeyDistributionMessage
 import com.ivor.kriptex.deliverypolicy.protocol.ProtocolInboundPipeline
 import com.ivor.kriptex.deliverypolicy.protocol.ProtocolInboundResult
 import com.ivor.kriptex.deliverypolicy.protocol.ProtocolMessage
@@ -14,6 +15,7 @@ import com.ivor.kriptex.deliverypolicy.protocol.SessionInitMessage
 import com.ivor.kriptex.deliverypolicy.protocol.UnknownMessage
 import com.ivor.kriptex.deliverypolicy.protocol.UserMessage
 import com.ivor.kriptex.deliverypolicy.routing.outbound.ProtocolOutboundEnqueuer
+import com.ivor.kriptex.deliverypolicy.routing.handlers.GroupMediaKeyDistributionHandler
 import com.ivor.kriptex.deliverypolicy.routing.handlers.SenderKeyDistributionHandler
 import com.ivor.kriptex.deliverypolicy.routing.handlers.SenderKeyGroupMessageHandler
 import com.ivor.kriptex.deliverypolicy.persistence.PersistedProtocolInboundPipelineSnapshot
@@ -116,6 +118,18 @@ class ProtocolMessageRouterTest {
         }
     }
 
+    private class FakeGroupMediaDistributionHandler : GroupMediaKeyDistributionHandler {
+        var applyCalled = 0
+
+        override fun applyInboundGroupMediaKeyDistribution(
+            authenticatedPeerIdentityPublicKey: ByteArray,
+            msg: GroupMediaKeyDistributionMessage,
+        ): GroupMediaKeyDistributionHandler.InboundApplyResult {
+            applyCalled++
+            return GroupMediaKeyDistributionHandler.InboundApplyResult(accepted = true)
+        }
+    }
+
     private fun ctx(session: Boolean, restore: Boolean, authenticated: Boolean = true) = RoutingContext(
         peerId = "P",
         authenticatedPeerIdentityPublicKey = if (authenticated) ByteArray(32) { 1 } else null,
@@ -133,6 +147,7 @@ class ProtocolMessageRouterTest {
         val handshake = FakeHandshakeHandler(codec)
         val dist = FakeDistributionHandler()
         val group = FakeGroupHandler()
+        val gmk = FakeGroupMediaDistributionHandler()
 
         val router = DefaultProtocolMessageRouter(
             encoder = codec,
@@ -141,6 +156,7 @@ class ProtocolMessageRouterTest {
             handshakeHandler = handshake,
             senderKeyDistributionHandler = dist,
             senderKeyGroupMessageHandler = group,
+            groupMediaKeyDistributionHandler = gmk,
         )
 
         val user = UserMessage("u1", "c1", 1L, byteArrayOf(9))
@@ -165,6 +181,22 @@ class ProtocolMessageRouterTest {
         assertTrue(rSkg is RoutingResult.Accepted)
         assertEquals(ProtocolMessageKind.GROUP_MESSAGE, rSkg.kind)
         assertEquals(1, group.decryptCalled)
+
+        val gmkd = GroupMediaKeyDistributionMessage(
+            messageId = "gmkd1",
+            conversationId = "g1",
+            createdAtElapsedMs = 6L,
+            groupId = ByteArray(32) { 3 },
+            senderIdentityPublicKey = ByteArray(32) { 1 },
+            senderKeyId = 1L,
+            counter = 1L,
+            mediaId = "m1",
+            ciphertext = byteArrayOf(8, 8),
+        )
+        val rGmkd = router.route(gmkd, ctx(session = true, restore = true))
+        assertTrue(rGmkd is RoutingResult.Accepted)
+        assertEquals(ProtocolMessageKind.GROUP_MEDIA_KEY_DISTRIBUTION, rGmkd.kind)
+        assertEquals(1, gmk.applyCalled)
 
         val init = SessionInitMessage(
             messageId = "si1",

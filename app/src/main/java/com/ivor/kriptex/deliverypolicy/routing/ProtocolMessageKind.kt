@@ -1,6 +1,7 @@
 package com.ivor.kriptex.deliverypolicy.routing
 
 import com.ivor.kriptex.deliverypolicy.protocol.AckMessage
+import com.ivor.kriptex.deliverypolicy.protocol.GroupMediaKeyDistributionMessage
 import com.ivor.kriptex.deliverypolicy.protocol.ProtocolMessage
 import com.ivor.kriptex.deliverypolicy.protocol.SenderKeyDistributionMessage
 import com.ivor.kriptex.deliverypolicy.protocol.SenderKeyGroupMessage
@@ -13,6 +14,7 @@ enum class ProtocolMessageKind {
     ONE_TO_ONE_USER,
     GROUP_MESSAGE,
     SENDER_KEY_DISTRIBUTION,
+    GROUP_MEDIA_KEY_DISTRIBUTION,
     ACK,
     HANDSHAKE,
     UNKNOWN,
@@ -25,6 +27,7 @@ enum class ProtocolMessageKind {
                 is UserMessage -> ONE_TO_ONE_USER
                 is SenderKeyGroupMessage -> GROUP_MESSAGE
                 is SenderKeyDistributionMessage -> SENDER_KEY_DISTRIBUTION
+                is GroupMediaKeyDistributionMessage -> GROUP_MEDIA_KEY_DISTRIBUTION
                 is AckMessage -> ACK
                 is SessionInitMessage,
                 is SessionAcceptMessage,

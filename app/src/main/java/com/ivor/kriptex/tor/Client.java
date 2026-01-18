@@ -16,8 +16,10 @@ import android.util.Log;
 import com.google.gson.Gson;
 import com.ivor.kriptex.BuildConfig;
 import com.ivor.kriptex.crypto.AdvancedCrypto;
+import com.ivor.kriptex.crypto.media.MediaAttachmentCrypto;
 import com.ivor.kriptex.db.Contact;
 import com.ivor.kriptex.db.Database;
+import com.ivor.kriptex.db.FileShare;
 import com.ivor.kriptex.db.Message;
 import com.ivor.kriptex.db.TorData;
 import com.ivor.kriptex.db.TorRequest;
@@ -181,19 +183,41 @@ public class Client {
             // Can't send without the recipient RSA pubkey; key exchange will be handled elsewhere.
             return false;
         }
-        resolveQuoteMessageId(message); // resolve quoted message id
+
+        // Work on a detached copy to avoid mutating Realm-managed objects.
         Gson gson = new Gson();
+        Message sendMessage = gson.fromJson(gson.toJson(message), Message.class);
+        resolveQuoteMessageId(sendMessage); // resolve quoted message id
+
         TorData td = new TorData();
-        td.setSender(message.getSender());
-        td.setReceiver(message.getReceiver());
+        td.setSender(sendMessage.getSender());
+        td.setReceiver(sendMessage.getReceiver());
         td.setDataType(TorData.TYPE_MESSAGE);
-        if (message.getFileShare() != null) {
-            message.getFileShare().setFilePath("");
-            message.getFileShare().setDownloaded(false);
-        }
         String key = UUID.randomUUID().toString();
+
+        if (sendMessage.getFileShare() != null) {
+            // Prevent leaking local file paths; receiver downloads separately.
+            sendMessage.getFileShare().setFilePath("");
+            sendMessage.getFileShare().setDownloaded(false);
+
+            // If this is an E2EE attachment, re-wrap the media key under the per-message key.
+            FileShare fs = sendMessage.getFileShare();
+            if (fs.getMediaId() != null && !fs.getMediaId().trim().isEmpty()) {
+                byte[] deviceWrapped = fs.getEncryptedMediaKey();
+                if (deviceWrapped == null || deviceWrapped.length == 0) {
+                    throw new IllegalStateException("E2EE attachment missing encryptedMediaKey");
+                }
+                byte[] mediaKey = MediaAttachmentCrypto.unwrapMediaKeyFromDevice(deviceWrapped, tor);
+                byte[] transportWrapped = MediaAttachmentCrypto.wrapMediaKeyForTransport(mediaKey, key, sendMessage, fs);
+                fs.setEncryptedMediaKey(transportWrapped);
+                if (fs.getMediaAEAD() == null || fs.getMediaAEAD().trim().isEmpty()) {
+                    fs.setMediaAEAD(MediaAttachmentCrypto.AEAD_XCHACHA20_POLY1305);
+                }
+            }
+        }
+
         AdvancedCrypto advancedCrypto = new AdvancedCrypto(key);
-        String content = advancedCrypto.encrypt(gson.toJson(message));
+        String content = advancedCrypto.encrypt(gson.toJson(sendMessage));
         td.setData(content);
         String encryptedKey = tor.encryptByPublicKey(key, contact.getPubKey());
         log("Encrypted key: " + encryptedKey);
@@ -203,7 +227,7 @@ public class Client {
         String jsonContent = gson.toJson(td);
         jsonContent = Util.base64encode(jsonContent.getBytes(StandardCharsets.UTF_8));
         String sender = tor.getID();
-        if (message.getReceiver().equals(sender)) return false;
+        if (sendMessage.getReceiver().equals(sender)) return false;
 
         return sock.queryBool(
                 "msg",

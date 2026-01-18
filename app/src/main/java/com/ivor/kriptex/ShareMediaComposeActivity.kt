@@ -53,6 +53,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.ivor.kriptex.db.Contact
 import com.ivor.kriptex.db.Message
+import com.ivor.kriptex.crypto.media.MediaAttachmentCrypto
 import com.ivor.kriptex.service.VideoTranscodeService
 import com.ivor.kriptex.tor.Client
 import com.ivor.kriptex.tor.FileServer
@@ -250,10 +251,18 @@ class ShareMediaComposeActivity : AppCompatActivity() {
                 sendVideo(sender, msg, currentPath, currentMime, selectedAddresses)
             }
             else -> {
-                for (a in selectedAddresses) {
-                    sendMessage(sender, a, msg, currentPath, currentMime, type, null)
-                }
-                finish()
+                queueE2eeToRecipients(
+                    sender = sender,
+                    message = msg,
+                    displayFilePath = currentPath,
+                    filename = File(currentPath).name,
+                    mimeType = currentMime,
+                    type = type,
+                    thumbnail = null,
+                    plaintextBytes = null,
+                    plaintextFile = File(currentPath),
+                    recipients = selectedAddresses
+                )
             }
         }
     }
@@ -268,30 +277,32 @@ class ShareMediaComposeActivity : AppCompatActivity() {
         thread {
             try {
                 val inputFile = File(inputPath)
-                val outFile = File(filesDir, inputFile.name)
 
                 val resized = Util.lessResolution(inputFile.absolutePath, 1280, 720)
-                val thumbnailBytes: ByteArray
-
-                FileOutputStream(outFile).use { out ->
-                    resized.compress(Bitmap.CompressFormat.JPEG, 75, out)
-                    out.flush()
-                }
+                val baos = java.io.ByteArrayOutputStream()
+                resized.compress(Bitmap.CompressFormat.JPEG, 75, baos)
+                val plainBytes = baos.toByteArray()
 
                 val thumb = Bitmap.createScaledBitmap(resized, 64, 64, false)
-                val baos = java.io.ByteArrayOutputStream()
-                thumb.compress(Bitmap.CompressFormat.JPEG, 100, baos)
-                thumbnailBytes = baos.toByteArray()
+                val thumbOut = java.io.ByteArrayOutputStream()
+                thumb.compress(Bitmap.CompressFormat.JPEG, 100, thumbOut)
+                val thumbnailBytes = thumbOut.toByteArray()
 
                 resized.recycle()
                 thumb.recycle()
 
-                runOnUiThread {
-                    for (a in recipients) {
-                        sendMessage(sender, a, message, outFile.absolutePath, mime, Message.TYPE_IMAGE, thumbnailBytes)
-                    }
-                    finish()
-                }
+                queueE2eeToRecipients(
+                    sender = sender,
+                    message = message,
+                    displayFilePath = inputFile.absolutePath,
+                    filename = inputFile.name,
+                    mimeType = "image/jpeg",
+                    type = Message.TYPE_IMAGE,
+                    thumbnail = thumbnailBytes,
+                    plaintextBytes = plainBytes,
+                    plaintextFile = null,
+                    recipients = recipients
+                )
             } catch (_: Exception) {
                 runOnUiThread {
                     Toast.makeText(this, "Failed to resize image", Toast.LENGTH_SHORT).show()
@@ -346,9 +357,18 @@ class ShareMediaComposeActivity : AppCompatActivity() {
             } else {
                 null
             }
-            for (a in recipients) {
-                sendMessage(sender, a, message, inputPath, mime, Message.TYPE_VIDEO, thumbBytes)
-            }
+            queueE2eeToRecipients(
+                sender = sender,
+                message = message,
+                displayFilePath = inputPath,
+                filename = File(inputPath).name,
+                mimeType = mime,
+                type = Message.TYPE_VIDEO,
+                thumbnail = thumbBytes,
+                plaintextBytes = null,
+                plaintextFile = File(inputPath),
+                recipients = recipients
+            )
         }
 
         finish()
@@ -360,26 +380,83 @@ class ShareMediaComposeActivity : AppCompatActivity() {
         return fileSizeInMB > 5
     }
 
-    private fun sendMessage(
+    private fun queueE2eeToRecipients(
         sender: String,
-        receiver: String,
         message: String,
-        filePath: String,
+        displayFilePath: String,
+        filename: String,
         mimeType: String,
         type: Int,
         thumbnail: ByteArray?,
+        plaintextBytes: ByteArray?,
+        plaintextFile: File?,
+        recipients: Set<String>,
     ) {
-        Message.addPendingOutgoingMessage(
-            sender,
-            receiver,
-            message,
-            File(filePath).name,
-            filePath,
-            mimeType,
-            type,
-            thumbnail
-        )
-        Client.getInstance(this).startSendPendingMessages(receiver)
+        thread {
+            try {
+                val (plaintextSize, plaintextSha256) = if (plaintextBytes != null) {
+                    plaintextBytes.size.toLong() to MediaAttachmentCrypto.sha256Bytes(plaintextBytes)
+                } else {
+                    val f = plaintextFile ?: throw IllegalStateException("missing_plaintext")
+                    f.length() to MediaAttachmentCrypto.sha256File(f)
+                }
+
+                val mediaId = MediaAttachmentCrypto.randomMediaIdUuid()
+                val mediaKey = MediaAttachmentCrypto.randomMediaKey32()
+
+                val chunkSize = MediaAttachmentCrypto.CHUNK_SIZE_DEFAULT_BYTES
+                val enc = if (plaintextBytes != null) {
+                    MediaAttachmentCrypto.encryptBytesToChunkedCiphertexts(
+                        this@ShareMediaComposeActivity,
+                        plaintextBytes,
+                        mediaId,
+                        mediaKey,
+                        chunkSize,
+                        plaintextSha256
+                    )
+                } else {
+                    val f = plaintextFile ?: throw IllegalStateException("missing_plaintext")
+                    MediaAttachmentCrypto.encryptFileToChunkedCiphertexts(
+                        this@ShareMediaComposeActivity,
+                        f,
+                        mediaId,
+                        mediaKey,
+                        chunkSize,
+                        plaintextSize,
+                        plaintextSha256
+                    )
+                }
+                val wrappedForDevice = MediaAttachmentCrypto.wrapMediaKeyForDevice(mediaKey, Tor.getInstance(this@ShareMediaComposeActivity))
+
+                for (r in recipients) {
+                    Message.addPendingOutgoingChunkedMessage(
+                        sender,
+                        r,
+                        message,
+                        filename,
+                        displayFilePath,
+                        mimeType,
+                        type,
+                        thumbnail,
+                        mediaId,
+                        wrappedForDevice,
+                        MediaAttachmentCrypto.AEAD_XCHACHA20_POLY1305,
+                        enc.totalCiphertextBytes,
+                        plaintextSize,
+                        plaintextSha256,
+                        enc.chunkSize,
+                        enc.totalChunks
+                    )
+                    Client.getInstance(this@ShareMediaComposeActivity).startSendPendingMessages(r)
+                }
+
+                runOnUiThread { finish() }
+            } catch (t: Throwable) {
+                runOnUiThread {
+                    Toast.makeText(this, "Failed to encrypt attachment", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
     }
 }
 

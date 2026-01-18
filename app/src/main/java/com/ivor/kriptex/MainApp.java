@@ -59,7 +59,7 @@ public class MainApp extends MultiDexApplication {
                 // creating rooms). Allowing UI-thread writes prevents runtime crashes.
                 .allowWritesOnUiThread(true)
                 .allowQueriesOnUiThread(true)
-            .schemaVersion(4)
+            .schemaVersion(7)
                 .migration((realm, oldVersion, newVersion) -> {
 
                     Log.d(TAG, "onCreate: Old Version: " + oldVersion + " New Version: " + newVersion);
@@ -123,6 +123,69 @@ public class MainApp extends MultiDexApplication {
                                 schema.get("ChatRoom")
                                         .addField("lastReadStableId", long.class)
                                         .addIndex("lastReadStableId");
+                            }
+                            oldVersion++;
+                            continue;
+                        }
+
+                        if (oldVersion == 4) {
+                            // E2EE attachment metadata stored on FileShare.
+                            if (schema.get("FileShare") != null) {
+                                if (!schema.get("FileShare").hasField("mediaId")) {
+                                    schema.get("FileShare").addField("mediaId", String.class);
+                                }
+                                if (!schema.get("FileShare").hasField("mediaBlobId")) {
+                                    schema.get("FileShare").addField("mediaBlobId", String.class);
+                                }
+                                if (!schema.get("FileShare").hasField("encryptedMediaKey")) {
+                                    schema.get("FileShare").addField("encryptedMediaKey", byte[].class);
+                                }
+                                if (!schema.get("FileShare").hasField("mediaAEAD")) {
+                                    schema.get("FileShare").addField("mediaAEAD", String.class);
+                                }
+                                if (!schema.get("FileShare").hasField("ciphertextSize")) {
+                                    schema.get("FileShare").addField("ciphertextSize", long.class);
+                                }
+                            }
+                            oldVersion++;
+                            continue;
+                        }
+
+                        if (oldVersion == 5) {
+                            // Phase 2 hardening fields.
+                            if (schema.get("FileShare") != null) {
+                                if (!schema.get("FileShare").hasField("plaintextSha256")) {
+                                    schema.get("FileShare").addField("plaintextSha256", byte[].class);
+                                }
+                                if (!schema.get("FileShare").hasField("serveRequestCount")) {
+                                    schema.get("FileShare").addField("serveRequestCount", int.class);
+                                }
+                                if (!schema.get("FileShare").hasField("maxServeRequests")) {
+                                    schema.get("FileShare").addField("maxServeRequests", int.class);
+                                }
+                            }
+                            oldVersion++;
+                            continue;
+                        }
+
+                        if (oldVersion == 6) {
+                            // Phase 3 chunked media delivery fields.
+                            if (schema.get("FileShare") != null) {
+                                if (!schema.get("FileShare").hasField("chunked")) {
+                                    schema.get("FileShare").addField("chunked", boolean.class);
+                                }
+                                if (!schema.get("FileShare").hasField("chunkSize")) {
+                                    schema.get("FileShare").addField("chunkSize", int.class);
+                                }
+                                if (!schema.get("FileShare").hasField("totalChunks")) {
+                                    schema.get("FileShare").addField("totalChunks", int.class);
+                                }
+                                if (!schema.get("FileShare").hasField("manifestVerified")) {
+                                    schema.get("FileShare").addField("manifestVerified", boolean.class);
+                                }
+                                if (!schema.get("FileShare").hasField("chunkBitmap")) {
+                                    schema.get("FileShare").addField("chunkBitmap", byte[].class);
+                                }
                             }
                             oldVersion++;
                             continue;

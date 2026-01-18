@@ -17,15 +17,17 @@ import androidx.appcompat.app.AppCompatActivity;
 import com.bumptech.glide.Glide;
 import com.google.android.material.floatingactionbutton.FloatingActionButton;
 import com.ivor.kriptex.db.Message;
-import com.ivor.kriptex.service.VideoTranscodeService;
+import com.ivor.kriptex.crypto.media.MediaAttachmentCrypto;
 import com.ivor.kriptex.tor.Client;
 import com.ivor.kriptex.tor.FileServer;
 import com.ivor.kriptex.tor.Tor;
+import com.ivor.kriptex.service.VideoTranscodeService;
 import com.ivor.kriptex.utils.Util;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileOutputStream;
+import java.io.IOException;
+import java.security.GeneralSecurityException;
 import java.util.UUID;
 
 //import com.ivor.kriptex.transformation.VideoRequestHandler;
@@ -87,96 +89,178 @@ public class SendMediaActivity extends AppCompatActivity {
             String message = txtDescription.getText().toString();
             message = message.trim();
 
-            if (mAttachFileType == Message.TYPE_IMAGE) {
-                new ResizeImage(sender, message, mAttachFileType).execute(mFilePath);
-            } else if (mAttachFileType == Message.TYPE_VIDEO) {
-                Bitmap bitmap = ((BitmapDrawable) imvwImage.getDrawable()).getBitmap();
-                Bitmap imageBitmap = ThumbnailUtils.extractThumbnail(bitmap, 64, 64);
-                String thumbFileName = UUID.randomUUID().toString();
-                String thumbnailFilePath = Util.writeBitmapCache(this, imageBitmap, thumbFileName);
-                imageBitmap.recycle();
-
-                VideoTranscodeService.startVideoTranscode(this,
-                        mFilePath, new File(getFilesDir(), UUID.randomUUID().toString() + ".mp4").getAbsolutePath(), new String[]{mAddress}, message, mimeType, mAttachFileType, thumbnailFilePath);
+            if (mAttachFileType == Message.TYPE_VIDEO && checkSizeIsLarge(mFilePath)) {
+                // Preserve legacy behavior for large videos: transcode first (existing service), then send.
+                byte[] thumbBytes = maybeBuildThumbnailBytes(imvwImage, mAttachFileType);
+                VideoTranscodeService.startVideoTranscodeWithThumbBytes(
+                        this,
+                        mFilePath,
+                        new File(getFilesDir(), UUID.randomUUID().toString() + ".mp4").getAbsolutePath(),
+                        new String[]{mAddress},
+                        message,
+                        mimeType,
+                        mAttachFileType,
+                        thumbBytes);
                 finish();
-            } else {
-                sendMessage(sender, message, mFilePath, mimeType, mAttachFileType, null);
-                finish();
+                return;
             }
+
+            // Application-layer E2EE: encrypt the served bytes before queuing the message.
+            // UI continues to reference the original path for local viewing.
+            new EncryptAndQueueAttachmentTask(sender, message, mimeType, mAttachFileType).execute(mFilePath);
         });
     }
 
-    private void sendMessage(String sender, String message, String filePath, String mimeType, int type, byte[] thumbnail) {
-        Message.addPendingOutgoingMessage(
-                sender,
-                mAddress,
-                message,
-                new File(filePath).getName(),
-                filePath,
-                mimeType,
-                type != -1 ? type : mAttachFileType,
-                thumbnail);
-        Client.getInstance(this).startSendPendingMessages(mAddress);
+    private static boolean checkSizeIsLarge(String filepath) {
+        File file = new File(filepath);
+        long fileSizeInMB = (file.length() / 1024) / 1024;
+        return fileSizeInMB > 5;
+    }
+
+    private static byte[] maybeBuildThumbnailBytes(ImageView imvwImage, int type) {
+        if (type != Message.TYPE_IMAGE && type != Message.TYPE_VIDEO) return null;
+        try {
+            Bitmap bitmap = ((BitmapDrawable) imvwImage.getDrawable()).getBitmap();
+            if (bitmap == null) return null;
+            Bitmap thumb = ThumbnailUtils.extractThumbnail(bitmap, Util.THUMBNAIL_SIZE, Util.THUMBNAIL_SIZE);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            thumb.compress(Bitmap.CompressFormat.JPEG, 50, baos);
+            thumb.recycle();
+            return baos.toByteArray();
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     void log(String s) {
         Log.d("SendMediaActivity", s);
     }
 
-    class ResizeImage extends AsyncTask<String, Void, String> {
 
-        private static final String TAG = "ResizeImage";
-        private String mSender;
-        private String mMessage;
-        private int mType;
-        private byte[] thumbnail;
+    class EncryptAndQueueAttachmentTask extends AsyncTask<String, Void, Boolean> {
 
-        public ResizeImage(String sender, String message, int type) {
-            mSender = sender;
-            mMessage = message;
-            mType = type;
+        private final String sender;
+        private final String message;
+        private final String mimeType;
+        private final int type;
+
+        private String error;
+
+        EncryptAndQueueAttachmentTask(String sender, String message, String mimeType, int type) {
+            this.sender = sender;
+            this.message = message;
+            this.mimeType = mimeType;
+            this.type = type;
         }
 
         @Override
         protected void onPreExecute() {
             super.onPreExecute();
-            Toast.makeText(SendMediaActivity.this, "Resizing image", Toast.LENGTH_SHORT).show();
+            Toast.makeText(SendMediaActivity.this, "Encrypting attachment...", Toast.LENGTH_SHORT).show();
         }
 
         @Override
-        protected String doInBackground(String... strings) {
-            File inputFile = new File(strings[0]);
-            File file = new File(getFilesDir(), inputFile.getName());
-            Bitmap out = Util.lessResolution(inputFile.getAbsolutePath(), 1280, 720);
-            log("Image resized: " + out.getWidth() + "x" + out.getHeight());
-            FileOutputStream fOut;
+        protected Boolean doInBackground(String... strings) {
             try {
-                fOut = new FileOutputStream(file);
-                out.compress(Bitmap.CompressFormat.JPEG, 75, fOut);
-                fOut.flush();
-                fOut.close();
+                File inputFile = new File(strings[0]);
+                if (!inputFile.exists()) {
+                    error = "File not found";
+                    return false;
+                }
 
-                Bitmap imageBitmap = ThumbnailUtils.extractThumbnail(out, Util.THUMBNAIL_SIZE, Util.THUMBNAIL_SIZE);
-                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                imageBitmap.compress(Bitmap.CompressFormat.JPEG, 50, baos);
-                thumbnail = baos.toByteArray();
+                // Phase 2: preserve legacy image resize semantics without writing plaintext resized files.
+                final String finalMime;
+                final byte[] plaintextSha256;
+                final long plaintextSize;
+                final byte[] resizedPlainBytes;
+                final byte[] thumbnail;
 
-                out.recycle();
-            } catch (Exception e) {
-                e.printStackTrace();
+                if (type == Message.TYPE_IMAGE) {
+                    Bitmap resized = Util.lessResolution(inputFile.getAbsolutePath(), 1280, 720);
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    resized.compress(Bitmap.CompressFormat.JPEG, 75, baos);
+                    resizedPlainBytes = baos.toByteArray();
+                    plaintextSize = resizedPlainBytes.length;
+                    finalMime = "image/jpeg";
+                    plaintextSha256 = MediaAttachmentCrypto.sha256Bytes(resizedPlainBytes);
+
+                    Bitmap thumb = ThumbnailUtils.extractThumbnail(resized, Util.THUMBNAIL_SIZE, Util.THUMBNAIL_SIZE);
+                    ByteArrayOutputStream thumbOut = new ByteArrayOutputStream();
+                    thumb.compress(Bitmap.CompressFormat.JPEG, 50, thumbOut);
+                    thumbnail = thumbOut.toByteArray();
+
+                    resized.recycle();
+                    thumb.recycle();
+                } else {
+                    resizedPlainBytes = null;
+                    plaintextSize = inputFile.length();
+                    finalMime = (mimeType != null && !mimeType.trim().isEmpty()) ? mimeType : (FileServer.getMimeType(inputFile.getAbsolutePath()));
+                    plaintextSha256 = MediaAttachmentCrypto.sha256File(inputFile);
+                    thumbnail = maybeBuildThumbnailBytes(imvwImage, type);
+                }
+
+                String mediaId = MediaAttachmentCrypto.randomMediaIdUuid();
+                byte[] mediaKey = MediaAttachmentCrypto.randomMediaKey32();
+
+                int chunkSize = MediaAttachmentCrypto.CHUNK_SIZE_DEFAULT_BYTES;
+                MediaAttachmentCrypto.ChunkedEncryptionResult enc;
+                if (resizedPlainBytes != null) {
+                    enc = MediaAttachmentCrypto.encryptBytesToChunkedCiphertexts(
+                            SendMediaActivity.this,
+                            resizedPlainBytes,
+                            mediaId,
+                            mediaKey,
+                            chunkSize,
+                            plaintextSha256);
+                } else {
+                    enc = MediaAttachmentCrypto.encryptFileToChunkedCiphertexts(
+                            SendMediaActivity.this,
+                            inputFile,
+                            mediaId,
+                            mediaKey,
+                            chunkSize,
+                            plaintextSize,
+                            plaintextSha256);
+                }
+                byte[] wrappedForDevice = MediaAttachmentCrypto.wrapMediaKeyForDevice(mediaKey, Tor.getInstance(SendMediaActivity.this));
+
+                Message.addPendingOutgoingChunkedMessage(
+                        sender,
+                        mAddress,
+                        message,
+                        inputFile.getName(),
+                        inputFile.getAbsolutePath(),
+                        finalMime,
+                        type != -1 ? type : mAttachFileType,
+                        thumbnail,
+                        mediaId,
+                        wrappedForDevice,
+                        MediaAttachmentCrypto.AEAD_XCHACHA20_POLY1305,
+                        enc.totalCiphertextBytes,
+                        plaintextSize,
+                        plaintextSha256,
+                        enc.chunkSize,
+                        enc.totalChunks);
+
+                return true;
+            } catch (IOException | GeneralSecurityException e) {
+                error = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                return false;
+            } catch (Throwable t) {
+                error = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+                return false;
             }
-            return file.getAbsolutePath();
         }
 
         @Override
-        protected void onPostExecute(String s) {
-            super.onPostExecute(s);
-            if (s != null) {
-                Log.d(TAG, "onPostExecute: Resize file path: " + s);
-                Toast.makeText(SendMediaActivity.this, "Image resized, sending...", Toast.LENGTH_SHORT).show();
-                sendMessage(mSender, mMessage, s, "image/jpeg", mType, thumbnail);
+        protected void onPostExecute(Boolean ok) {
+            super.onPostExecute(ok);
+            if (ok) {
+                Client.getInstance(SendMediaActivity.this).startSendPendingMessages(mAddress);
+                finish();
+            } else {
+                Toast.makeText(SendMediaActivity.this, "Attachment encryption failed: " + error, Toast.LENGTH_LONG).show();
             }
-            finish();
         }
     }
 }

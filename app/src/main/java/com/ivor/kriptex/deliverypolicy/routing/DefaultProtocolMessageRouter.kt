@@ -2,6 +2,7 @@ package com.ivor.kriptex.deliverypolicy.routing
 
 import com.ivor.kriptex.deliverypolicy.outbox.EnqueueResult
 import com.ivor.kriptex.deliverypolicy.protocol.AckMessage
+import com.ivor.kriptex.deliverypolicy.protocol.GroupMediaKeyDistributionMessage
 import com.ivor.kriptex.deliverypolicy.protocol.ProtocolEncoder
 import com.ivor.kriptex.deliverypolicy.protocol.ProtocolInboundPipeline
 import com.ivor.kriptex.deliverypolicy.protocol.ProtocolInboundResult
@@ -12,6 +13,7 @@ import com.ivor.kriptex.deliverypolicy.protocol.SessionAcceptMessage
 import com.ivor.kriptex.deliverypolicy.protocol.SessionInitMessage
 import com.ivor.kriptex.deliverypolicy.protocol.UserMessage
 import com.ivor.kriptex.deliverypolicy.routing.outbound.ProtocolOutboundEnqueuer
+import com.ivor.kriptex.deliverypolicy.routing.handlers.GroupMediaKeyDistributionHandler
 import com.ivor.kriptex.deliverypolicy.routing.handlers.SenderKeyDistributionHandler
 import com.ivor.kriptex.deliverypolicy.routing.handlers.SenderKeyGroupMessageHandler
 
@@ -22,6 +24,7 @@ class DefaultProtocolMessageRouter(
     private val handshakeHandler: ProtocolHandshakeHandler,
     private val senderKeyDistributionHandler: SenderKeyDistributionHandler? = null,
     private val senderKeyGroupMessageHandler: SenderKeyGroupMessageHandler? = null,
+    private val groupMediaKeyDistributionHandler: GroupMediaKeyDistributionHandler? = null,
     private val debugTrace: ProtocolRoutingDebugTrace = NoOpProtocolRoutingDebugTrace,
 ) : ProtocolMessageRouter {
 
@@ -35,8 +38,33 @@ class DefaultProtocolMessageRouter(
             ProtocolMessageKind.ONE_TO_ONE_USER -> routeUser(message as UserMessage, kind, context)
             ProtocolMessageKind.SENDER_KEY_DISTRIBUTION -> routeDistribution(message as SenderKeyDistributionMessage, kind, context)
             ProtocolMessageKind.GROUP_MESSAGE -> routeGroup(message as SenderKeyGroupMessage, kind, context)
+            ProtocolMessageKind.GROUP_MEDIA_KEY_DISTRIBUTION -> routeGroupMediaKeyDistribution(message as GroupMediaKeyDistributionMessage, kind, context)
             ProtocolMessageKind.UNKNOWN -> reject(message, kind, "unknown_message_type")
         }
+    }
+
+    private fun routeGroupMediaKeyDistribution(
+        message: GroupMediaKeyDistributionMessage,
+        kind: ProtocolMessageKind,
+        context: RoutingContext,
+    ): RoutingResult {
+        if (!context.isSessionEnveloped) return reject(message, kind, "group_media_distribution_must_be_session_enveloped")
+        val engine = groupMediaKeyDistributionHandler ?: return reject(message, kind, "group_media_distribution_engine_missing")
+        val authenticated = context.authenticatedPeerIdentityPublicKey ?: return reject(message, kind, "missing_authenticated_peer")
+
+        val decision = engine.applyInboundGroupMediaKeyDistribution(
+            authenticatedPeerIdentityPublicKey = authenticated,
+            msg = message,
+        )
+        if (!decision.accepted) return reject(message, kind, decision.reason ?: "group_media_distribution_rejected")
+
+        val bytes = encoder.encode(message)
+        val inboundResult = inbound.onInboundBytes(bytes, context.receivedAtElapsedMs, context.senderId)
+        val pending = if (context.isRestore) emptyList() else inbound.drainPendingOutbound()
+
+        val enqueued = enqueueOutbound(pending, context)
+        debugTrace.onRouted(message.messageId, message.conversationId, kind, RoutingDecision.ACCEPTED, "group_media_distribution")
+        return RoutingResult.Accepted(kind = kind, inbound = inboundResult, enqueuedOutbound = enqueued, target = "group_media_distribution")
     }
 
     private fun routeHandshake(message: ProtocolMessage, kind: ProtocolMessageKind, context: RoutingContext): RoutingResult {

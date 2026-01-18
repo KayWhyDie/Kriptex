@@ -101,6 +101,21 @@ class InMemoryProtocolInboundPipeline(
                 debugTrace.onOutboundPending(ack.messageId, ack.conversationId, ack.type, clock.nowMs())
             }
 
+            is GroupMediaKeyDistributionMessage -> {
+                ledger.recordReceived(decoded.messageId, decoded.conversationId)
+
+                val ack = AckMessage(
+                    messageId = messageIdGenerator.nextId(),
+                    conversationId = decoded.conversationId,
+                    createdAtElapsedMs = clock.nowMs(),
+                    ackedMessageId = decoded.messageId,
+                )
+                val encodedAck = encoder.encode(ack)
+                debugTrace.onEncode(ack.messageId, ack.conversationId, ack.type, clock.nowMs(), encodedAck.size)
+                pendingOutboundEncoded.add(encodedAck)
+                debugTrace.onOutboundPending(ack.messageId, ack.conversationId, ack.type, clock.nowMs())
+            }
+
             is AckMessage -> {
                 // ACK affects the acked message, not this messageId.
                 ledger.recordAcked(decoded.ackedMessageId)

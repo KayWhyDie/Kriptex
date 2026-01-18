@@ -169,4 +169,32 @@ class BinaryProtocolCodecTest {
         assertEquals(9L, decoded.counter)
         assertArrayEquals(byteArrayOf(1, 2, 3, 4, 5), decoded.ciphertext)
     }
+
+    @Test
+    fun group_media_key_distribution_round_trip() {
+        val msg = GroupMediaKeyDistributionMessage(
+            messageId = "gmkd1",
+            conversationId = "g1",
+            createdAtElapsedMs = 1111L,
+            groupId = ByteArray(32) { 6 },
+            senderIdentityPublicKey = ByteArray(32) { 2 },
+            senderKeyId = 7L,
+            counter = 3L,
+            mediaId = "media-123",
+            ciphertext = byteArrayOf(8, 9, 10),
+        )
+
+        val bytes = codec.encode(msg)
+        val decoded = codec.decode(bytes) as GroupMediaKeyDistributionMessage
+
+        assertEquals("gmkd1", decoded.messageId)
+        assertEquals("g1", decoded.conversationId)
+        assertEquals(1111L, decoded.createdAtElapsedMs)
+        assertArrayEquals(ByteArray(32) { 6 }, decoded.groupId)
+        assertArrayEquals(ByteArray(32) { 2 }, decoded.senderIdentityPublicKey)
+        assertEquals(7L, decoded.senderKeyId)
+        assertEquals(3L, decoded.counter)
+        assertEquals("media-123", decoded.mediaId)
+        assertArrayEquals(byteArrayOf(8, 9, 10), decoded.ciphertext)
+    }
 }

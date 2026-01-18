@@ -17,6 +17,7 @@ import androidx.core.app.NotificationCompat;
 import com.daasuu.mp4compose.FillMode;
 import com.daasuu.mp4compose.composer.Mp4Composer;
 import com.ivor.kriptex.R;
+import com.ivor.kriptex.crypto.media.MediaAttachmentCrypto;
 import com.ivor.kriptex.db.Message;
 import com.ivor.kriptex.tor.Client;
 import com.ivor.kriptex.tor.Tor;
@@ -24,6 +25,7 @@ import com.ivor.kriptex.utils.Util;
 
 import java.io.File;
 import java.io.IOException;
+import java.security.GeneralSecurityException;
 
 /**
  * An {@link IntentService} subclass for handling asynchronous task requests in
@@ -46,6 +48,7 @@ public class VideoTranscodeService extends IntentService {
     private static final String EXTRA_MIME_TYPE = "com.ivor.kriptex.service.extra.MIME_TYPE";
     private static final String EXTRA_ATTACH_FILE_TYPE = "com.ivor.kriptex.service.extra.ATTACH_FILE_TYPE";
     private static final String EXTRA_THUMB_FILE_PATH = "com.ivor.kriptex.service.extra.THUMB_FILE_PATH";
+    private static final String EXTRA_THUMB_BYTES = "com.ivor.kriptex.service.extra.THUMB_BYTES";
     private static final int NOTIFICATION_ID = 9;
 
     public VideoTranscodeService() {
@@ -73,6 +76,26 @@ public class VideoTranscodeService extends IntentService {
         intent.putExtra(EXTRA_MIME_TYPE, mimeType);
         intent.putExtra(EXTRA_ATTACH_FILE_TYPE, fileType);
         intent.putExtra(EXTRA_THUMB_FILE_PATH, thumbFilePath);
+        context.startService(intent);
+    }
+
+    /**
+     * Variant that avoids writing a thumbnail file to disk; thumbnail bytes are sent as-is.
+     */
+    public static void startVideoTranscodeWithThumbBytes(Context context, String srcFile, String desFile,
+                                                         String[] receiver,
+                                                         String message,
+                                                         String mimeType,
+                                                         int fileType,
+                                                         byte[] thumbBytes) {
+        Intent intent = new Intent(context, VideoTranscodeService.class);
+        intent.putExtra(EXTRA_SRC_FILE, srcFile);
+        intent.putExtra(EXTRA_DEST_FILE, desFile);
+        intent.putExtra(EXTRA_RECEIVER, receiver);
+        intent.putExtra(EXTRA_MESSAGE, message);
+        intent.putExtra(EXTRA_MIME_TYPE, mimeType);
+        intent.putExtra(EXTRA_ATTACH_FILE_TYPE, fileType);
+        intent.putExtra(EXTRA_THUMB_BYTES, thumbBytes);
         context.startService(intent);
     }
 
@@ -120,9 +143,12 @@ public class VideoTranscodeService extends IntentService {
             String mimeType = getString(EXTRA_MIME_TYPE, intent);
             int attachFileType = getInt(EXTRA_ATTACH_FILE_TYPE, intent);
             String thumbnailFilePath = getString(EXTRA_THUMB_FILE_PATH, intent);
+            byte[] thumbnailBytes = intent.getByteArrayExtra(EXTRA_THUMB_BYTES);
 
             final String srcMp4Path = intent.getStringExtra(EXTRA_SRC_FILE);
             final String destMp4Path = intent.getStringExtra(EXTRA_DEST_FILE);
+
+            final byte[] thumb = thumbnailBytes != null ? thumbnailBytes : readThumbBestEffort(thumbnailFilePath);
 
             if (isTranscodeNecessary(srcMp4Path)) {
                 new Mp4Composer(srcMp4Path, destMp4Path)
@@ -141,12 +167,9 @@ public class VideoTranscodeService extends IntentService {
                                 cancelNotification();
 
                                 try {
-                                    byte[] thumbnail = Util.readSmallFile(getApplicationContext(), thumbnailFilePath);
-                                    for (String r : receivers) {
-                                        sendMessage(r, message, destMp4Path, mimeType, attachFileType, thumbnail);
-                                    }
-                                } catch (IOException e) {
-                                    e.printStackTrace();
+                                    sendE2eeToAll(receivers, message, srcMp4Path, destMp4Path, mimeType, attachFileType, thumb);
+                                } catch (Throwable t) {
+                                    t.printStackTrace();
                                 }
                             }
 
@@ -166,14 +189,93 @@ public class VideoTranscodeService extends IntentService {
                         .start();
             } else {
                 try {
-                    byte[] thumbnail = Util.readSmallFile(getApplicationContext(), thumbnailFilePath);
-                    for (String r : receivers) {
-                        sendMessage(r, message, srcMp4Path, mimeType, attachFileType, thumbnail);
-                    }
-                } catch (IOException e) {
-                    e.printStackTrace();
+                    sendE2eeToAll(receivers, message, srcMp4Path, null, mimeType, attachFileType, thumb);
+                } catch (Throwable t) {
+                    t.printStackTrace();
                 }
             }
+        }
+    }
+
+    private byte[] readThumbBestEffort(String thumbnailFilePath) {
+        if (thumbnailFilePath == null || thumbnailFilePath.trim().isEmpty()) return null;
+        try {
+            return Util.readSmallFile(getApplicationContext(), thumbnailFilePath);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Phase 2 E2EE: encrypt video bytes for serving, bind plaintext SHA-256 into AAD, and queue messages.
+     *
+     * <p>Note: when a transcode output path is provided, it is used as the source bytes for encryption,
+     * then deleted after ciphertext is produced (best-effort).</p>
+     */
+    private void sendE2eeToAll(String[] receivers,
+                              String message,
+                              String displayFilePath,
+                              String transcodeOutputPath,
+                              String mimeType,
+                              int type,
+                              byte[] thumbnail) throws IOException, GeneralSecurityException {
+        if (receivers == null || receivers.length == 0) return;
+
+        String sender = Tor.getInstance(this).getID();
+        if (sender == null || sender.trim().isEmpty()) return;
+
+        File plainFile = new File(transcodeOutputPath != null ? transcodeOutputPath : displayFilePath);
+        if (!plainFile.exists()) throw new IOException("video_source_missing");
+
+        String finalMime = (mimeType == null || mimeType.trim().isEmpty()) ? "video/mp4" : mimeType;
+        long plaintextSize = plainFile.length();
+        byte[] plaintextSha256 = MediaAttachmentCrypto.sha256File(plainFile);
+
+        String mediaId = MediaAttachmentCrypto.randomMediaIdUuid();
+        byte[] mediaKey = MediaAttachmentCrypto.randomMediaKey32();
+
+        int chunkSize = MediaAttachmentCrypto.CHUNK_SIZE_DEFAULT_BYTES;
+        MediaAttachmentCrypto.ChunkedEncryptionResult enc = MediaAttachmentCrypto.encryptFileToChunkedCiphertexts(
+            getApplicationContext(),
+            plainFile,
+            mediaId,
+            mediaKey,
+            chunkSize,
+            plaintextSize,
+            plaintextSha256);
+        byte[] wrappedForDevice = MediaAttachmentCrypto.wrapMediaKeyForDevice(mediaKey, Tor.getInstance(getApplicationContext()));
+
+        // Best-effort: remove plaintext transcode output after ciphertext is written.
+        if (transcodeOutputPath != null) {
+            //noinspection ResultOfMethodCallIgnored
+            new File(transcodeOutputPath).delete();
+        }
+
+        for (String r : receivers) {
+            if (r == null || r.trim().isEmpty()) continue;
+
+            // Preserve legacy naming: if a transcode output existed, keep its filename.
+            String filename = transcodeOutputPath != null ? new File(transcodeOutputPath).getName() : new File(displayFilePath).getName();
+
+                Message.addPendingOutgoingChunkedMessage(
+                    sender,
+                    r,
+                    message,
+                    filename,
+                    displayFilePath,
+                    finalMime,
+                    type,
+                    thumbnail,
+                    mediaId,
+                    wrappedForDevice,
+                    MediaAttachmentCrypto.AEAD_XCHACHA20_POLY1305,
+                    enc.totalCiphertextBytes,
+                    plaintextSize,
+                    plaintextSha256,
+                    enc.chunkSize,
+                    enc.totalChunks);
+
+            Client.getInstance(this).startSendPendingMessages(r);
         }
     }
 
@@ -209,19 +311,7 @@ public class VideoTranscodeService extends IntentService {
         return channelId;
     }
 
-    private void sendMessage(String receiver, String message, String filePath, String mimeType, int type, byte[] thumbnail) {
-        String sender = Tor.getInstance(this).getID();
-        Message.addPendingOutgoingMessage(
-                sender,
-                receiver,
-                message,
-                new File(filePath).getName(),
-                filePath,
-                mimeType,
-                type,
-                thumbnail);
-        Client.getInstance(this).startSendPendingMessages(receiver);
-    }
+    // Legacy plaintext sender kept intentionally removed from the video pipeline.
 
     private void cancelNotification() {
         NotificationManager notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);

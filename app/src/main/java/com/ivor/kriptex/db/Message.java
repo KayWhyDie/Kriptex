@@ -353,7 +353,208 @@ public class Message extends RealmObject {
         fs.setFileSize(new File(filePath).length());
         fs.setDownloaded(true);
         fs.setServed(false);
+        fs.setServeRequestCount(0);
+        fs.setMaxServeRequests(32);
         fs.setThumbnail(thumbnail);
+        message.setFileShare(fs);
+
+        Contact contact = realm.where(Contact.class).equalTo("address", receiver).findFirst();
+        if (contact != null) {
+            contact.setLastMessageTime(message.getTime());
+        }
+
+        realm.commitTransaction();
+        String primaryKey = message.getPrimaryKey();
+        realm.close();
+        return primaryKey;
+    }
+
+    /**
+     * Pending outgoing attachment message with application-layer E2EE metadata.
+     *
+     * <p>Note: encryptedMediaKey is stored device-wrapped for persistence. The transport layer
+     * re-wraps it under the per-message key right before sending.</p>
+     */
+    public static synchronized String addPendingOutgoingMessage(
+            String sender,
+            String receiver,
+            String content,
+            String filename,
+            String filePath,
+            String mimeType,
+            int type,
+            byte[] thumbnail,
+            String mediaId,
+            byte[] encryptedMediaKey,
+            String mediaAEAD,
+            long ciphertextSize) {
+        // Backward compatible overload: uses filePath length as plaintext size and has no plaintext hash.
+        long plaintextSize = new File(filePath).length();
+        return addPendingOutgoingMessage(
+            sender,
+            receiver,
+            content,
+            filename,
+            filePath,
+            mimeType,
+            type,
+            thumbnail,
+            mediaId,
+            mediaId,
+            encryptedMediaKey,
+            mediaAEAD,
+            ciphertextSize,
+            plaintextSize,
+            null,
+            64);
+        }
+
+        /**
+         * Pending outgoing attachment message with application-layer E2EE metadata (Phase 2).
+         *
+         * <p>Notes:</p>
+         * <ul>
+         *   <li>plaintextSize and plaintextSha256 must describe the exact plaintext bytes that were encrypted.</li>
+         *   <li>encryptedMediaKey is stored device-wrapped for persistence; transport re-wrap happens at send time.</li>
+         * </ul>
+         */
+        public static synchronized String addPendingOutgoingMessage(
+            String sender,
+            String receiver,
+            String content,
+            String filename,
+            String filePath,
+            String mimeType,
+            int type,
+            byte[] thumbnail,
+            String mediaId,
+            String mediaBlobId,
+            byte[] encryptedMediaKey,
+            String mediaAEAD,
+            long ciphertextSize,
+            long plaintextSize,
+            byte[] plaintextSha256,
+            int maxServeRequests) {
+        Realm realm = Realm.getDefaultInstance();
+        realm.beginTransaction();
+        Message message = realm.createObject(Message.class, UUID.randomUUID().toString());
+        message.setStableId(getNextStableId());
+        message.setSender(sender);
+        message.setReceiver(receiver);
+        message.setContent(content);
+        message.setTime(System.currentTimeMillis());
+        message.setPending(1);
+        message.setType(type);
+
+        FileShare fs = realm.createObject(FileShare.class, getNextFileId());
+        fs.setFilename(filename);
+        fs.setFilePath(filePath);
+        fs.setMimeType(mimeType);
+        SecureRandom random = new SecureRandom();
+        byte[] bytes = new byte[32];
+        random.nextBytes(bytes);
+        fs.setPassword(AdvancedCrypto.toHex(bytes));
+        fs.setFileSize(plaintextSize);
+        fs.setDownloaded(true);
+        fs.setServed(false);
+        fs.setServeRequestCount(0);
+        fs.setMaxServeRequests(maxServeRequests);
+        fs.setThumbnail(thumbnail);
+
+        fs.setMediaId(mediaId);
+        fs.setMediaBlobId(mediaBlobId);
+        fs.setEncryptedMediaKey(encryptedMediaKey);
+        fs.setMediaAEAD(mediaAEAD);
+        fs.setCiphertextSize(ciphertextSize);
+        fs.setPlaintextSha256(plaintextSha256);
+
+        // Phase 3: default non-chunked unless explicitly set via the chunked overload.
+        fs.setChunked(false);
+        fs.setChunkSize(0);
+        fs.setTotalChunks(0);
+        fs.setManifestVerified(false);
+        fs.setChunkBitmap(null);
+
+        // Phase 3.5: defaults for LRU/eviction metadata.
+        fs.setChunkedLastAccessMs(0);
+        fs.setChunkedEvictedAtMs(0);
+        fs.setChunkedEvictReason("");
+
+        message.setFileShare(fs);
+
+        Contact contact = realm.where(Contact.class).equalTo("address", receiver).findFirst();
+        if (contact != null) {
+            contact.setLastMessageTime(message.getTime());
+        }
+
+        realm.commitTransaction();
+        String primaryKey = message.getPrimaryKey();
+        realm.close();
+        return primaryKey;
+    }
+
+    /**
+     * Pending outgoing attachment message with application-layer E2EE metadata (Phase 3 chunked).
+     */
+    public static synchronized String addPendingOutgoingChunkedMessage(
+            String sender,
+            String receiver,
+            String content,
+            String filename,
+            String filePath,
+            String mimeType,
+            int type,
+            byte[] thumbnail,
+            String mediaId,
+            byte[] encryptedMediaKey,
+            String mediaAEAD,
+            long totalCiphertextSize,
+            long plaintextSize,
+            byte[] plaintextSha256,
+            int chunkSize,
+            int totalChunks) {
+        Realm realm = Realm.getDefaultInstance();
+        realm.beginTransaction();
+        Message message = realm.createObject(Message.class, UUID.randomUUID().toString());
+        message.setStableId(getNextStableId());
+        message.setSender(sender);
+        message.setReceiver(receiver);
+        message.setContent(content);
+        message.setTime(System.currentTimeMillis());
+        message.setPending(1);
+        message.setType(type);
+
+        FileShare fs = realm.createObject(FileShare.class, getNextFileId());
+        fs.setFilename(filename);
+        fs.setFilePath(filePath);
+        fs.setMimeType(mimeType);
+        // Password is kept for legacy attachments only; chunked media does not rely on it.
+        fs.setPassword("");
+        fs.setFileSize(plaintextSize);
+        fs.setDownloaded(true);
+        fs.setServed(false);
+        fs.setServeRequestCount(0);
+        fs.setMaxServeRequests(0);
+        fs.setThumbnail(thumbnail);
+
+        fs.setMediaId(mediaId);
+        fs.setMediaBlobId(mediaId);
+        fs.setEncryptedMediaKey(encryptedMediaKey);
+        fs.setMediaAEAD(mediaAEAD);
+        fs.setCiphertextSize(totalCiphertextSize);
+        fs.setPlaintextSha256(plaintextSha256);
+
+        fs.setChunked(true);
+        fs.setChunkSize(chunkSize);
+        fs.setTotalChunks(totalChunks);
+        fs.setManifestVerified(false);
+        fs.setChunkBitmap(null);
+
+        // Phase 3.5: defaults for LRU/eviction metadata.
+        fs.setChunkedLastAccessMs(0);
+        fs.setChunkedEvictedAtMs(0);
+        fs.setChunkedEvictReason("");
+
         message.setFileShare(fs);
 
         Contact contact = realm.where(Contact.class).equalTo("address", receiver).findFirst();
@@ -378,6 +579,11 @@ public class Message extends RealmObject {
     }
 
     public static String getDownloadUrl(Message message) {
-        return "https://" + message.getSender() + ".onion:" + Tor.getFileServerPort() + "/" + message.getFileShare().getFilename();
+        if (message == null || message.getFileShare() == null) return "";
+        FileShare fs = message.getFileShare();
+        if (fs.isChunked() && fs.getMediaId() != null && !fs.getMediaId().trim().isEmpty()) {
+            return "https://" + message.getSender() + ".onion:" + Tor.getFileServerPort() + "/media/" + fs.getMediaId() + "/manifest";
+        }
+        return "https://" + message.getSender() + ".onion:" + Tor.getFileServerPort() + "/" + fs.getFilename();
     }
 }

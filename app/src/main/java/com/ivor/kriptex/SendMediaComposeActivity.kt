@@ -35,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.bumptech.glide.Glide
+import com.ivor.kriptex.crypto.media.MediaAttachmentCrypto
 import com.ivor.kriptex.db.Message
 import com.ivor.kriptex.service.VideoTranscodeService
 import com.ivor.kriptex.tor.Client
@@ -44,7 +45,6 @@ import com.ivor.kriptex.ui.compose.KriptexTheme
 import com.ivor.kriptex.utils.Util
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileOutputStream
 import java.util.UUID
 
 class SendMediaComposeActivity : ComponentActivity() {
@@ -109,19 +109,21 @@ class SendMediaComposeActivity : ComponentActivity() {
         val type = attachFileType
 
         if (type == Message.TYPE_IMAGE) {
-            ResizeImageTask(sender, msg, type).execute(filePath)
+            EncryptAndQueueTask(sender, msg, type, mimeType).execute(filePath)
             return
         }
 
         if (type == Message.TYPE_VIDEO) {
             val thumb = buildThumbnailFromCurrentPreview(filePath)
-            val thumbFilePath = if (thumb != null) {
-                Util.writeBitmapCache(this, thumb, UUID.randomUUID().toString())
+            val thumbBytes = if (thumb != null) {
+                val baos = ByteArrayOutputStream()
+                thumb.compress(Bitmap.CompressFormat.JPEG, 100, baos)
+                baos.toByteArray()
             } else {
                 null
             }
 
-            VideoTranscodeService.startVideoTranscode(
+            VideoTranscodeService.startVideoTranscodeWithThumbBytes(
                 this,
                 filePath,
                 File(filesDir, UUID.randomUUID().toString() + ".mp4").absolutePath,
@@ -129,13 +131,13 @@ class SendMediaComposeActivity : ComponentActivity() {
                 msg,
                 mimeType,
                 type,
-                thumbFilePath
+                thumbBytes
             )
             finish()
             return
         }
 
-        sendMessage(sender, msg, filePath, mimeType, type, null)
+        EncryptAndQueueTask(sender, msg, type, mimeType).execute(filePath)
         finish()
     }
 
@@ -152,68 +154,129 @@ class SendMediaComposeActivity : ComponentActivity() {
         }
     }
 
-    private fun sendMessage(
-        sender: String,
-        message: String,
-        filePath: String,
-        mimeType: String?,
-        type: Int,
-        thumbnail: ByteArray?
-    ) {
-        Message.addPendingOutgoingMessage(
-            sender,
-            address,
-            message,
-            File(filePath).name,
-            filePath,
-            mimeType,
-            type,
-            thumbnail
-        )
-        Client.getInstance(this).startSendPendingMessages(address)
-    }
-
-    private inner class ResizeImageTask(
+    private inner class EncryptAndQueueTask(
         private val sender: String,
         private val message: String,
-        private val type: Int
-    ) : AsyncTask<String, Void, String?>() {
+        private val type: Int,
+        private val mimeType: String?,
+    ) : AsyncTask<String, Void, Boolean>() {
 
-        private var thumbnailBytes: ByteArray? = null
+        private var error: String? = null
 
         override fun onPreExecute() {
-            Toast.makeText(this@SendMediaComposeActivity, "Resizing image", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this@SendMediaComposeActivity, "Encrypting attachment…", Toast.LENGTH_SHORT).show()
         }
 
-        override fun doInBackground(vararg params: String): String? {
+        override fun doInBackground(vararg params: String): Boolean {
             return try {
                 val inputFile = File(params[0])
-                val outFile = File(filesDir, inputFile.name)
-                val out = Util.lessResolution(inputFile.absolutePath, 1280, 720)
-                FileOutputStream(outFile).use { fos ->
-                    out.compress(Bitmap.CompressFormat.JPEG, 75, fos)
+                if (!inputFile.exists()) throw IllegalStateException("File missing")
+
+                val (finalMime, finalPlainBytes, thumbnailBytes, plaintextSize, plaintextSha256) =
+                    if (type == Message.TYPE_IMAGE) {
+                        val resized = Util.lessResolution(inputFile.absolutePath, 1280, 720)
+
+                        val baos = ByteArrayOutputStream()
+                        resized.compress(Bitmap.CompressFormat.JPEG, 75, baos)
+                        val plainBytes = baos.toByteArray()
+
+                        val thumbBitmap = ThumbnailUtils.extractThumbnail(resized, Util.THUMBNAIL_SIZE, Util.THUMBNAIL_SIZE)
+                        val thumbOut = ByteArrayOutputStream()
+                        thumbBitmap.compress(Bitmap.CompressFormat.JPEG, 50, thumbOut)
+
+                        val sha = MediaAttachmentCrypto.sha256Bytes(plainBytes)
+
+                        resized.recycle()
+                        thumbBitmap.recycle()
+
+                        FiveTuple(
+                            "image/jpeg",
+                            plainBytes,
+                            thumbOut.toByteArray(),
+                            plainBytes.size.toLong(),
+                            sha
+                        )
+                    } else {
+                        val sha = MediaAttachmentCrypto.sha256File(inputFile)
+                        FiveTuple(
+                            (mimeType ?: FileServer.getMimeType(inputFile.absolutePath) ?: "application/octet-stream"),
+                            null,
+                            null,
+                            inputFile.length(),
+                            sha
+                        )
+                    }
+
+                val mediaId = MediaAttachmentCrypto.randomMediaIdUuid()
+                val mediaKey = MediaAttachmentCrypto.randomMediaKey32()
+
+                val chunkSize = MediaAttachmentCrypto.CHUNK_SIZE_DEFAULT_BYTES
+                val enc = if (finalPlainBytes != null) {
+                    MediaAttachmentCrypto.encryptBytesToChunkedCiphertexts(
+                        this@SendMediaComposeActivity,
+                        finalPlainBytes,
+                        mediaId,
+                        mediaKey,
+                        chunkSize,
+                        plaintextSha256
+                    )
+                } else {
+                    MediaAttachmentCrypto.encryptFileToChunkedCiphertexts(
+                        this@SendMediaComposeActivity,
+                        inputFile,
+                        mediaId,
+                        mediaKey,
+                        chunkSize,
+                        plaintextSize,
+                        plaintextSha256
+                    )
                 }
 
-                val thumbBitmap = ThumbnailUtils.extractThumbnail(out, Util.THUMBNAIL_SIZE, Util.THUMBNAIL_SIZE)
-                val baos = ByteArrayOutputStream()
-                thumbBitmap.compress(Bitmap.CompressFormat.JPEG, 50, baos)
-                thumbnailBytes = baos.toByteArray()
+                val wrappedForDevice = MediaAttachmentCrypto.wrapMediaKeyForDevice(mediaKey, Tor.getInstance(this@SendMediaComposeActivity))
 
-                out.recycle()
-                outFile.absolutePath
-            } catch (_: Exception) {
-                null
+                Message.addPendingOutgoingChunkedMessage(
+                    sender,
+                    address,
+                    message,
+                    inputFile.name,
+                    inputFile.absolutePath,
+                    finalMime,
+                    type,
+                    thumbnailBytes,
+                    mediaId,
+                    wrappedForDevice,
+                    MediaAttachmentCrypto.AEAD_XCHACHA20_POLY1305,
+                    enc.totalCiphertextBytes,
+                    plaintextSize,
+                    plaintextSha256,
+                    enc.chunkSize,
+                    enc.totalChunks
+                )
+
+                true
+            } catch (t: Throwable) {
+                error = t.message ?: t.javaClass.simpleName
+                false
             }
         }
 
-        override fun onPostExecute(result: String?) {
-            if (result != null) {
-                Toast.makeText(this@SendMediaComposeActivity, "Image resized, sending…", Toast.LENGTH_SHORT).show()
-                sendMessage(sender, message, result, "image/jpeg", type, thumbnailBytes)
+        override fun onPostExecute(ok: Boolean) {
+            if (ok) {
+                Client.getInstance(this@SendMediaComposeActivity).startSendPendingMessages(address)
+                finish()
+            } else {
+                Toast.makeText(this@SendMediaComposeActivity, "Attachment encryption failed: $error", Toast.LENGTH_LONG).show()
             }
-            finish()
         }
     }
+
+    private data class FiveTuple(
+        val mime: String,
+        val plainBytes: ByteArray?,
+        val thumbnailBytes: ByteArray?,
+        val plaintextSize: Long,
+        val plaintextSha256: ByteArray,
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
